@@ -155,6 +155,7 @@ iw() {
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
   [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
   [[ -n "${WANT_UPDATE_CLAUDE+x}" ]] && env_args+=(IWORK_UPDATE_CLAUDE="$WANT_UPDATE_CLAUDE")
+  [[ -n "${WANT_MASTER_RC:-}" ]] && env_args+=(IWORK_MASTER_REMOTE_CONTROL="$WANT_MASTER_RC")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
@@ -3076,6 +3077,101 @@ test_resurrect_keeps_a_master_window() {
   WANT_TMUX=1 iw resurrect >/dev/null 2>&1
   assert_contains "the master window survives the sweep" "myproj" \
     "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+}
+
+# The default claude stub throws its arguments away, and what these are about is
+# exactly the arguments: which sessions get Remote Control and under what name.
+recording_claude() {
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$SB/claude-argv"
+exit 0
+STUB
+  chmod +x "$SB/bin/claude"
+}
+
+# send-keys returns before the pane's shell has run anything.
+wait_for_claude_argv() {
+  local waited=0
+  while (( waited < 50 )); do
+    grep -q "$1" "$SB/claude-argv" 2>/dev/null && return 0
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+test_master_remote_control_names_the_master() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  WANT_MASTER_RC=on iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw --detach feat/two -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv 'remote-control' || true
+  local argv
+  argv="$(cat "$SB/claude-argv" 2>/dev/null)"
+  assert_contains "the master is started with Remote Control" \
+    "--remote-control myproj (master)" "$argv"
+  # Only the master: the task was started first, so its line is the one without.
+  assert_eq "and the task is not" "1" "$(grep -c 'remote-control' "$SB/claude-argv" 2>/dev/null | tr -d ' ')"
+}
+
+test_master_remote_control_is_off_by_default() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv '' || true
+  case "$(cat "$SB/claude-argv" 2>/dev/null)" in
+    *remote-control*) bad "a master got Remote Control without asking for it" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_remote_control_passes_the_message_through() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw -m 'plan the split' master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv 'plan the split' || true
+  # The optional name must not swallow the prompt, and the prompt stays last.
+  assert_contains "flag, name and prompt all arrive in order" \
+    "--remote-control myproj (master) -- plan the split" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
+test_resurrect_keeps_remote_control_on_a_master() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw master myproj >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on iw resurrect -n 2>&1)"
+  assert_contains "the master comes back with Remote Control" \
+    "master of 'myproj': would run 'claude --continue --remote-control myproj\ \(master\)'" "$out"
+  assert_contains "and the task comes back without" "feat-one: would run 'claude --continue'" "$out"
+}
+
+test_update_keeps_remote_control_on_a_master() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw master myproj >/dev/null 2>&1
+  wait_for_agent '=projects-myproj:myproj' || { printf '    skip (agent never started)\n'; return 0; }
+  wait_for_agent '=projects-myproj:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on WANT_UPDATE_CLAUDE="$(bump_version_command)" iw update-agents -n 2>&1)"
+  assert_contains "the master restarts with Remote Control" \
+    "master of 'myproj': would restart with 'claude --continue --remote-control myproj\ \(master\)'" "$out"
+  assert_contains "and the task without" "feat-one: would restart with 'claude --continue'" "$out"
 }
 
 test_resurrect_gathers_a_projects_task_back_into_its_session() {

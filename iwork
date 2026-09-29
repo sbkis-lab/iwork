@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX IWORK_MASTER_REMOTE_CONTROL)
 
 load_config() {
   local var="" restore=""
@@ -51,6 +51,9 @@ IWORK_UPDATE_CLAUDE="${IWORK_UPDATE_CLAUDE:-}"
 IWORK_UPDATE_CODEX="${IWORK_UPDATE_CODEX:-}"
 IWORK_RESUME_CLAUDE="${IWORK_RESUME_CLAUDE:-}"
 IWORK_RESUME_CODEX="${IWORK_RESUME_CODEX:-}"
+# 'on' starts every claude master with Remote Control, so a project can be
+# steered from the Claude apps as well as from tmux (see master_remote_control_name).
+IWORK_MASTER_REMOTE_CONTROL="${IWORK_MASTER_REMOTE_CONTROL:-off}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 IWORK_DETACH="${IWORK_DETACH:-}"
@@ -402,6 +405,10 @@ Master:
   The master's instructions come from the SessionStart hook, so 'install-hooks'
   is not optional for it: without the hooks it starts as an ordinary agent in a
   directory of markdown, and says so.
+
+  IWORK_MASTER_REMOTE_CONTROL=on starts a claude master with Remote Control,
+  named '<project> (master)', so it can be reached from the Claude apps too.
+  resurrect and update-agents keep it on when they restart it; tasks never get it.
 
 Resurrect:
   A tmux server that dies takes every agent with it and nothing else. The
@@ -5222,6 +5229,37 @@ agent_resume_command() {
   esac
 }
 
+# The name a master answers to under Remote Control, or nothing when it has none.
+# Only masters: a project is what you steer from a phone, and its tasks are
+# reached through it -- a dozen task sessions in the app would bury the one that
+# matters. Only claude, because the flag is claude's.
+master_remote_control_name() {
+  local project="$1"
+  local tool="${2:-claude}"
+
+  [[ "$tool" == "claude" ]] || return 1
+  case "$IWORK_MASTER_REMOTE_CONTROL" in
+    on) printf '%s (master)\n' "$project" ;;
+    *) return 1 ;;
+  esac
+}
+
+# A master's resume line: the tool's own, plus the flag it was started with.
+# Restarting without it would quietly drop the session off the phone, which is
+# exactly when nobody is at the terminal to notice.
+master_resume_command() {
+  local project="$1"
+  local tool="$2"
+  local base="$3"
+  local name=""
+  local flag=""
+
+  if name="$(master_remote_control_name "$project" "$tool")"; then
+    printf -v flag ' --remote-control %q' "$name"
+  fi
+  printf '%s%s\n' "$base" "$flag"
+}
+
 # Follow a symlink chain by hand: 'readlink -f' is GNU, and macOS ships bash 3.2
 # and a readlink without it.
 resolve_symlinks() {
@@ -5332,6 +5370,7 @@ restart_task_agent() {
   local pane="$1"
   local what="$2"
   local tool="$3"
+  local project="${4:-}"
   local resume=""
   local pid=""
   local waited=0
@@ -5340,6 +5379,7 @@ restart_task_agent() {
     warn "$what: no resume command known for '$tool'; set IWORK_RESUME_$(agent_config_suffix "$tool")"
     return 0
   }
+  [[ -z "$project" ]] || resume="$(master_resume_command "$project" "$tool" "$resume")"
 
   if ! pane_is_idle_shell "$pane"; then
     if ! pid="$(pane_foreground_pid "$pane")" || [[ -z "$pid" ]]; then
@@ -5375,7 +5415,10 @@ window_name_of() {
   tmux display-message -p -t "$1" '#{window_name}' 2>/dev/null || true
 }
 
-# Every agent iwork can see, one line each: "<label>\t<pane>\t<tool>\t<busy>".
+# Every agent iwork can see, one line each:
+# "<label>\t<pane>\t<tool>\t<project>\t<busy>". <project> is the project a
+# master runs and '-' for a task: tab is whitespace to 'read', so an empty field
+# in the middle would collapse and shift <busy> into its place.
 # Collected once and used twice -- to decide which tools need upgrading at all,
 # and then to restart what those upgrades touched.
 list_live_agents() {
@@ -5390,13 +5433,13 @@ list_live_agents() {
     [[ -n "$folder" ]] || continue
     line="$(locate_task_window "$folder")" || continue
     IFS=' ' read -r session window_id window_name <<< "$line"
-    emit_live_agent "$window_id" "$window_name" "$folder"
+    emit_live_agent "$window_id" "$window_name" "$folder" -
   done < <(list_worktree_folders)
 
   while IFS= read -r project; do
     [[ -n "$project" ]] || continue
     window_id="$(find_master_window "$project")" || continue
-    emit_live_agent "$window_id" "$(window_name_of "$window_id")" "master of '$project'"
+    emit_live_agent "$window_id" "$(window_name_of "$window_id")" "master of '$project'" "$project"
   done < <(list_projects)
 }
 
@@ -5404,6 +5447,7 @@ emit_live_agent() {
   local window_id="$1"
   local window_name="$2"
   local what="$3"
+  local project="$4"
   local pane=""
   local tool=""
   local busy=""
@@ -5416,7 +5460,7 @@ emit_live_agent() {
     '*'*) busy=1 ;;
   esac
 
-  printf '%s\t%s\t%s\t%s\n' "$what" "$pane" "$tool" "$busy"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$what" "$pane" "$tool" "$project" "$busy"
 }
 
 cmd_update_agents() {
@@ -5430,6 +5474,8 @@ cmd_update_agents() {
   local what=""
   local pane=""
   local is_busy=""
+  local project=""
+  local resume=""
   local update_cmd=""
   local before=""
   local after=""
@@ -5483,13 +5529,15 @@ cmd_update_agents() {
 
   if [[ -n "$dry" ]]; then
     echo "Dry run — nothing is changed. Agents that would be restarted:"
-    while IFS=$'\t' read -r what pane tool is_busy; do
+    while IFS=$'\t' read -r what pane tool project is_busy; do
       [[ -n "$what" ]] || continue
       if [[ -n "$is_busy" && -z "$busy" ]]; then
         echo "  $what: working right now, left alone (--busy to include it)"
         continue
       fi
-      echo "  $what: would restart with '$(agent_resume_command "$tool")'"
+      resume="$(agent_resume_command "$tool")"
+      [[ "$project" == "-" ]] || resume="$(master_resume_command "$project" "$tool" "$resume")"
+      echo "  $what: would restart with '$resume'"
     done <<< "$agents"
     return 0
   fi
@@ -5525,7 +5573,7 @@ cmd_update_agents() {
     return 0
   fi
 
-  while IFS=$'\t' read -r what pane tool is_busy; do
+  while IFS=$'\t' read -r what pane tool project is_busy; do
     [[ -n "$what" ]] || continue
 
     if [[ -z "$anyway" ]]; then
@@ -5542,7 +5590,8 @@ cmd_update_agents() {
       continue
     fi
 
-    restart_task_agent "$pane" "$what" "$tool"
+    [[ "$project" != "-" ]] || project=""
+    restart_task_agent "$pane" "$what" "$tool" "$project"
   done <<< "$agents"
 }
 
@@ -5804,10 +5853,14 @@ RESURRECT_BIG=()
 # conversation back up, which is the whole point of the exercise; --fresh drops
 # it for a task whose history is not worth resuming.
 resurrect_agent_cmd() {
-  if [[ -n "$RESURRECT_CONTINUE" ]]; then
-    printf 'claude --continue\n'
+  local project="${1:-}"
+  local cmd="claude"
+
+  [[ -z "$RESURRECT_CONTINUE" ]] || cmd="claude --continue"
+  if [[ -n "$project" ]]; then
+    master_resume_command "$project" claude "$cmd"
   else
-    printf 'claude\n'
+    printf '%s\n' "$cmd"
   fi
 }
 
@@ -5843,9 +5896,11 @@ window_agent_pane() {
   tmux list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | head -1
 }
 
+# A third argument names the project when the pane is its master's.
 resurrect_start_agent() {
   local pane="$1"
   local what="$2"
+  local project="${3:-}"
   local cmd=""
 
   cmd="$(pane_command "$pane")"
@@ -5865,16 +5920,16 @@ resurrect_start_agent() {
   fi
 
   if [[ -n "$RESURRECT_DRY" ]]; then
-    echo "  $what: would run '$(resurrect_agent_cmd)'"
+    echo "  $what: would run '$(resurrect_agent_cmd "$project")'"
     return 0
   fi
 
-  if ! tmux send-keys -t "$pane" "$(resurrect_agent_cmd)" Enter 2>/dev/null; then
+  if ! tmux send-keys -t "$pane" "$(resurrect_agent_cmd "$project")" Enter 2>/dev/null; then
     warn "$what: could not start the agent"
     return 1
   fi
 
-  echo "  $what: restarted with '$(resurrect_agent_cmd)'"
+  echo "  $what: restarted with '$(resurrect_agent_cmd "$project")'"
 }
 
 # Which task owns a '--big' session, and which project owns a project session.
@@ -6131,7 +6186,7 @@ resurrect_projects() {
 
     if window_id="$(resurrect_find_master "$project")"; then
       pane="$(window_agent_pane "$window_id")"
-      [[ -z "$pane" ]] || resurrect_start_agent "$pane" "master of '$project'"
+      [[ -z "$pane" ]] || resurrect_start_agent "$pane" "master of '$project'" "$project"
     else
       echo "  project '$project' has no master; start one with: iwork master $project"
     fi
@@ -6645,6 +6700,8 @@ run_init() {
     echo '# IWORK_UPDATE_COMMAND=        # how "iwork update" upgrades Claude Code'
     echo '# IWORK_SESSION_MARKERS=off   # on = put the agent marker on session'
     echo '#                             # names too (UNSTABLE: see iwork -h)'
+    echo '# IWORK_MASTER_REMOTE_CONTROL=off  # on = masters start with Claude'
+    echo '#                                  # Remote Control (see iwork -h)'
     echo '# IWORK_CONTEXT_TEMPLATE="$HOME/.config/iwork/task-context.md.tmpl"'
   } > "$IWORK_CONFIG_FILE" || die "could not write $IWORK_CONFIG_FILE"
 
@@ -6682,12 +6739,18 @@ start_master() {
     IWORK_DETACH=1
   fi
 
-  if ! tmux_enabled; then
-    cd "$dir"
-    exec claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  local rc_name=""
+  local rc_args=()
+  if rc_name="$(master_remote_control_name "$project")"; then
+    rc_args=(--remote-control "$rc_name")
   fi
 
-  open_master_window "$project" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  if ! tmux_enabled; then
+    cd "$dir"
+    exec claude ${rc_args[@]+"${rc_args[@]}"} ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  fi
+
+  open_master_window "$project" claude ${rc_args[@]+"${rc_args[@]}"} ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
 install_claude_hooks() {

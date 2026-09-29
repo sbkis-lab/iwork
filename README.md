@@ -628,6 +628,24 @@ looking fine.
 it, so every task agent can see whether a coordinator is live. It is not counted
 against any task: its row has no task, by definition.
 
+### Reaching a master from your phone
+
+```bash
+# ~/.config/iwork/config
+IWORK_MASTER_REMOTE_CONTROL=on
+```
+
+With this on, `iwork master` starts claude with `--remote-control "<project> (master)"`,
+so the project's master shows up in the Claude apps under that name and can be
+steered from there as well as from tmux. `resurrect` and `update-agents` carry
+the flag into the command they restart a master with; without that, the first
+restart would quietly drop it off the phone, which is exactly when nobody is at
+the terminal to notice.
+
+Only masters get it. A project is the thing you steer from a phone, and its
+tasks are reached through its master — a dozen task sessions in the app would
+bury the one that matters. Only claude, because the flag is claude's.
+
 ### Talking to the tasks
 
 A master that can only watch is a dashboard. Directing a task is done with Claude
@@ -1491,6 +1509,7 @@ overrides.
 | `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
 | `IWORK_UPDATE_CLAUDE`, `IWORK_UPDATE_CODEX` | detected | The command `iwork update-agents` runs to upgrade that agent. Empty means work it out from where its binary lives |
 | `IWORK_RESUME_CLAUDE`, `IWORK_RESUME_CODEX` | per agent | How that agent is told to resume. Defaults to `claude --continue` and `codex resume --last` |
+| `IWORK_MASTER_REMOTE_CONTROL` | `off` | `on` starts a claude master with Remote Control, named `<project> (master)` — see [Reaching a master from your phone](#reaching-a-master-from-your-phone) |
 | `IWORK_SESSION_MARKERS` | `off` | **Unstable.** `on` writes the agent marker into session *names* as well as window names. Makes session names unstable for every other tool — see [Session state without renaming](#session-state-without-renaming) |
 | `IWORK_SHOW_LOG_LINES` | `12` | How many log entries and past tasks `iwork project show` prints. Must be a positive integer; anything else warns and falls back to 12 |
 | `IWORK_EDITOR` | `nvim` | Editor started in each repo window under `--big`; run as a command line with the worktree appended |
