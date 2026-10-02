@@ -2565,6 +2565,74 @@ test_master_takes_the_first_window_of_its_session() {
     "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tail -n +2 | tr '\n' ' ')"
 }
 
+test_project_delete_cascade_needs_r_as_well_as_f() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+
+  # -f alone still means "I mean the memory", not "and everything attached".
+  assert_fails "still refused with -f alone" iw project delete -f myproj
+  assert_contains "and now says how to mean it" "pass -r" \
+    "$(iw project delete -f myproj 2>&1)"
+  assert_dir "nothing was deleted" "$SB_PROJECTS/myproj"
+  assert_dir "and the task is still there" "$SB_TASKS/feat-one"
+
+  # -r without -f is the other half missing.
+  assert_fails "refused with -r alone" iw project delete -r myproj
+  assert_contains "and asks for -f" "re-run with -f" \
+    "$(iw project delete -r myproj 2>&1)"
+}
+
+test_project_delete_cascade_takes_the_tasks_with_it() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend -p myproj >/dev/null 2>&1
+  iw feat/two -r backend -p myproj >/dev/null 2>&1
+  iw feat/elsewhere -r backend -p otherproj >/dev/null 2>&1
+
+  local out
+  out="$(iw project delete -rf myproj 2>&1)"
+
+  # Named one per line before anything goes, because the tasks are the
+  # expensive half of this.
+  assert_contains "the plan names the first task" "- feat-one" "$out"
+  assert_contains "and the second" "- feat-two" "$out"
+
+  assert_no_file "the project is gone" "$SB_PROJECTS/myproj"
+  assert_no_file "and its first task" "$SB_TASKS/feat-one"
+  assert_no_file "and its second" "$SB_TASKS/feat-two"
+
+  assert_dir "another project is untouched" "$SB_PROJECTS/otherproj"
+  assert_dir "and so is its task" "$SB_TASKS/feat-elsewhere"
+
+  # The branches are what make this recoverable at all.
+  assert_ok "the branch survives" git -C "$SB_REPOS/backend" rev-parse --verify feat/one
+  assert_ok "for every repo in it" git -C "$SB_REPOS/frontend" rev-parse --verify feat/one
+}
+
+test_project_delete_cascade_says_which_tasks_hold_uncommitted_work() {
+  mk_repo backend
+  iw feat/clean -r backend -p myproj >/dev/null 2>&1
+  iw feat/messy -r backend -p myproj >/dev/null 2>&1
+  printf 'half done\n' > "$SB_TASKS/feat-messy/backend/scratch.txt"
+
+  # -rf drops it, so the one thing this owes you is saying so first.
+  local out
+  out="$(iw project delete -rf myproj 2>&1)"
+  assert_contains "the dirty task is flagged" "feat-messy  (HOLDS UNCOMMITTED WORK" "$out"
+  case "$out" in
+    *"feat-clean  (HOLDS"*) bad "a clean task was flagged as dirty" ;;
+    *) ok ;;
+  esac
+  assert_no_file "and it still goes" "$SB_TASKS/feat-messy"
+}
+
+test_project_delete_cascade_accepts_either_spelling() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  iw project delete -fr myproj >/dev/null 2>&1
+  assert_no_file "-fr works like -rf" "$SB_PROJECTS/myproj"
+}
+
 test_project_delete_takes_the_session_with_it() {
   command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
   mk_repo backend

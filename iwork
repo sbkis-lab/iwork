@@ -112,7 +112,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork project cat [-p <project>] <path-inside-the-project>
        iwork project add <project> [<task>]
        iwork project rm [<project>] [<task>]
-       iwork project delete [-f] <project>
+       iwork project delete [-rf] <project>
 
        iwork todo "<what needs doing>" [-p <project>]
        iwork log [--decision|--shipped|--note] "<what>" [-p <project>]
@@ -1103,12 +1103,19 @@ find_client_refuge() {
 # because the alternative is tmux dropping it wherever it likes — or detaching
 # it outright when the session goes. This process dies with the target, so
 # nothing may follow it.
+# Set while something removes several tasks in a row. remove_worktrees ends by
+# running the deferred kill, and that kill takes this process with it -- so in a
+# cascade the first task that happened to be the window we are standing in would
+# end the run, with the rest of the project still there.
+DEFERRED_KILL_HELD=""
+
 run_deferred_kill() {
   local refuge=""
   local session=""
   local window_id=""
   local name=""
 
+  [[ -z "$DEFERRED_KILL_HELD" ]] || return 0
   [[ -n "$DEFERRED_KILL_KIND" ]] || return 0
 
   case "$DEFERRED_KILL_KIND" in
@@ -3855,12 +3862,27 @@ kill_project_tmux() {
   tmux kill-session -t "=$session" 2>/dev/null || warn "could not kill tmux session '$session'"
 }
 
+task_has_uncommitted() {
+  local folder_path="$TASKS_DIR/$1"
+  local wt=""
+
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    [[ -z "$(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null || true)" ]] ||
+      return 0
+  done < <(list_task_worktrees "$folder_path")
+
+  return 1
+}
+
 delete_project() {
   local project="$1"
   local force="$2"
+  local cascade="${3:-}"
   local attached=""
   local task=""
   local session=""
+  local dirty=""
 
   validate_project_name "$project"
   project_exists "$project" || die "no such project: $project"
@@ -3870,9 +3892,9 @@ delete_project() {
     [[ "$(task_project_name "$task" || true)" == "$project" ]] && attached="${attached:+$attached }$task"
   done < <(list_worktree_folders)
 
-  if [[ -n "$attached" ]]; then
+  if [[ -n "$attached" && -z "$cascade" ]]; then
     die "project '$project' still has tasks attached: $attached
-  Detach them first, or remove those tasks."
+  Detach them, remove them, or pass -r to take them with the project."
   fi
 
   if [[ -z "$force" ]]; then
@@ -3882,14 +3904,48 @@ delete_project() {
   echo "This deletes $PROJECTS_DIR/$project and everything in it:"
   echo "  PROJECT.md, LOG.md, TODO.md, history.tsv, agents.tsv, notes/"
 
-  # Worth spelling out: the session goes too, and the master runs in it. Its
-  # tasks cannot be in there — delete refuses while any are attached.
+  # The tasks are the expensive half, so they are named one per line with what
+  # each one costs. -rf is as far as this tool goes; nothing below this point
+  # asks again.
+  if [[ -n "$attached" ]]; then
+    echo ""
+    echo "and these tasks, with every worktree in them:"
+    for task in $attached; do
+      if task_has_uncommitted "$task"; then
+        echo "  - $task  (HOLDS UNCOMMITTED WORK, which -f drops)"
+        dirty=1
+      else
+        echo "  - $task"
+      fi
+    done
+    echo ""
+    echo "Branches are kept, as always, so a task here comes back with"
+    echo "'iwork <branch> --from <branch>'. The project memory does not."
+  fi
+
+  # Worth spelling out: the session goes too, and the master runs in it.
   if [[ -z "$IWORK_NO_TMUX" ]] && command -v tmux >/dev/null 2>&1 &&
      session="$(resolve_session_name "$(project_session_name "$project")")"; then
     echo "  tmux session '$session', with the master running in it"
   fi
 
-  confirm "Proceed?" || die "aborted"
+  if [[ -n "$dirty" ]]; then
+    confirm "Proceed, dropping that uncommitted work?" || die "aborted"
+  else
+    confirm "Proceed?" || die "aborted"
+  fi
+
+  # Tasks first: the project directory has to outlive them, because removing a
+  # task writes its closing row to the history that lives in there.
+  if [[ -n "$attached" ]]; then
+    DEFERRED_KILL_HELD=1
+    for task in $attached; do
+      echo ""
+      remove_worktrees "$task" "$force"
+    done
+    DEFERRED_KILL_HELD=""
+    echo ""
+  fi
 
   rm -rf "${PROJECTS_DIR:?}/${project:?}" || die "could not remove $PROJECTS_DIR/$project"
   kill_project_tmux "$project"
@@ -6502,7 +6558,10 @@ not run them unless you were asked to directly (a project's master may also run
 'iwork cull', which removes only tasks git can give back):
   iwork project add <project> [<task>]   attach a task that already exists
   iwork project rm [<project>] [<task>]  detach a task, keeping the memory
-  iwork project delete [-f] <project>    delete a project and its memory
+  iwork project delete [-rf] <project>   delete a project and its memory
+     -f is required; -r also takes every task still attached to it, with
+     every worktree in them. Both are listed before it asks, and a task
+     holding uncommitted work is flagged, because -f drops that
 
 For task and tmux management (creating tasks, add-repo, rm, park, resurrect,
 install-hooks) see 'iwork -h'.
@@ -6515,6 +6574,7 @@ cmd_project() {
   local task=""
   local branch=""
   local force=""
+  local cascade=""
   local count=""
   local format=""
   local rc=0
@@ -6631,15 +6691,18 @@ cmd_project() {
       while [[ $# -gt 0 ]]; do
         case "$1" in
           -f|--force) force=1; shift ;;
+          -r|--recursive) cascade=1; shift ;;
+          # One flag, written the way it reads: -rf.
+          -rf|-fr) force=1; cascade=1; shift ;;
           -*) die "unknown option '$1'" ;;
           *)
-            [[ -z "$proj" ]] || die "usage: iwork project delete [-f] <project>"
+            [[ -z "$proj" ]] || die "usage: iwork project delete [-rf] <project>"
             proj="$1"
             shift
             ;;
         esac
       done
-      [[ -n "$proj" ]] || die "usage: iwork project delete [-f] <project>"
+      [[ -n "$proj" ]] || die "usage: iwork project delete [-rf] <project>"
       require_config
       require_projects_dir
       # Destroys strictly more than rm does, and -f skips the confirmation that
@@ -6649,7 +6712,7 @@ cmd_project() {
   memory, and a master agent sits here. Run it from anywhere else — 'cd' out
   first — or, if you are an agent, ask the person running this."
       fi
-      delete_project "$proj" "$force"
+      delete_project "$proj" "$force" "$cascade"
       ;;
     ""|-h|--help)
       project_usage

@@ -670,8 +670,36 @@ the project log it duplicated.
 iwork project add auth-rewrite feat-existing-task    # attach a task that exists
 iwork project rm  auth-rewrite feat-existing-task    # detach; memory kept
 iwork project list
-iwork project delete -f auth-rewrite                 # deletes the memory, asks first
+iwork project delete -f  auth-rewrite                # deletes the memory, asks first
+iwork project delete -rf auth-rewrite                # and every task still attached
 ```
+
+#### Deleting a project that still has tasks
+
+`delete` refuses while anything is attached, because the memory it destroys is
+the one thing in iwork that cannot be rebuilt from git. `-r` takes them with it:
+
+```
+This deletes ~/dev/projects/projects/auth-rewrite and everything in it:
+  PROJECT.md, LOG.md, TODO.md, history.tsv, agents.tsv, notes/
+
+and these tasks, with every worktree in them:
+  - feat-token-api
+  - feat-session-store  (HOLDS UNCOMMITTED WORK, which -f drops)
+
+Branches are kept, as always, so a task here comes back with
+'iwork <branch> --from <branch>'. The project memory does not.
+```
+
+Both halves have to be spelled out — `-r` without `-f` is still refused, and `-f`
+without `-r` still stops at the attached tasks. Every task is named one per line
+before anything happens, and one holding uncommitted work is called out, since
+`-f` is what drops it. The confirmation says so too.
+
+Tasks go first, because removing one writes its closing row to the `history.tsv`
+that lives in the project directory. Their branches survive exactly as under
+`rm`, so the worktrees are re-creatable; the memory is not, which is the whole
+reason this is gated twice.
 
 A task belongs to exactly one project. Attaching it to a second one refuses rather
 than silently relinking, which would leave its history stranded in the first.
