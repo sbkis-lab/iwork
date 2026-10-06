@@ -1248,7 +1248,16 @@ remove_worktrees() {
   # the branch and repo list can still be recovered.
   project="$(task_project_name "$folder" || true)"
   if [[ -n "$project" ]] && project_exists "$project"; then
-    project_branch="$(detect_branch_from_worktree_folder "$folder" 2>/dev/null || true)"
+    # The '|| true' belongs on the assignment, not inside the substitution.
+    # detect_branch_from_worktree_folder reaches 'die' when a task's repos are on
+    # different branches, and 'die' calls exit -- which *terminates* the
+    # substitution's subshell rather than returning a status, so a '|| true' in
+    # there never runs. The failure then landed on the assignment, 'set -e' took
+    # the whole process, and 2>/dev/null had already eaten the one sentence that
+    # would have explained it: 'rm' on a mixed-branch task printed its plan,
+    # asked, and exited without removing anything or saying why.
+    project_branch="$(detect_branch_from_worktree_folder "$folder" 2>/dev/null)" ||
+      project_branch=""
     project_repos="$(task_repos_csv "$folder")"
   else
     project=""
