@@ -155,6 +155,8 @@ iw() {
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
   [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
   [[ -n "${WANT_UPDATE_CLAUDE+x}" ]] && env_args+=(IWORK_UPDATE_CLAUDE="$WANT_UPDATE_CLAUDE")
+  [[ -n "${WANT_AGENT:-}" ]] && env_args+=(IWORK_AGENT="$WANT_AGENT")
+  [[ -n "${WANT_AGENT_ARGS_CODEX:-}" ]] && env_args+=(IWORK_AGENT_ARGS_CODEX="$WANT_AGENT_ARGS_CODEX")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
@@ -3943,6 +3945,105 @@ test_rm_still_refuses_from_the_project_directory() {
     "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
 }
 
+# --- which CLI a task runs ---------------------------------------------------
+
+# iwork ran claude and only claude. 'iwork codex <task>' could open a task that
+# already existed, but nothing could create one, so a codex task was a thing you
+# could not get to.
+
+test_a_task_starts_the_configured_agent() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+
+  # The stubs exit at once, so what was asked for is read off the pane's
+  # scrollback rather than off a live process.
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  WANT_AGENT=codex WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "the task came up on codex" "CODEX RAN" \
+    "$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+}
+
+test_the_agent_flag_beats_the_config() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  WANT_TMUX=1 iw --agent codex --detach feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "the flag picked the agent" "CODEX RAN" \
+    "$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+}
+
+test_an_unknown_agent_is_refused() {
+  mk_repo backend
+  assert_fails "an agent iwork does not know is refused" \
+    iw --agent emacs feat/one -r backend
+  assert_contains "and says what it knows" "knows claude and codex" \
+    "$(iw --agent emacs feat/one -r backend 2>&1)"
+  assert_no_file "and nothing was created" "$SB_TASKS/feat-one"
+}
+
+test_per_agent_params_are_passed_on() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  WANT_AGENT=codex WANT_AGENT_ARGS_CODEX="--full-auto" WANT_TMUX=1 \
+    iw --detach feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "the configured params went with it" "CODEX RAN: --full-auto" \
+    "$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+}
+
+test_a_first_prompt_is_shaped_for_the_agent() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  # claude reads a first prompt after a '--'; codex takes it as its argument.
+  # Handing codex claude's shape would have it look for a file called '--'.
+  WANT_AGENT=codex WANT_TMUX=1 \
+    iw -m "look at the thing" --detach feat/one -r backend >/dev/null 2>&1
+
+  local out
+  out="$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+  assert_contains "the prompt reached codex" "look at the thing" "$out"
+  case "$out" in
+    *"CODEX RAN: --"*) bad "codex was handed claude's '--' shape" ;;
+    *) ok ;;
+  esac
+}
+
+test_a_task_can_be_named_the_way_its_branch_was() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # The folder is the branch with the slashes flattened, a mapping iwork
+  # invented and then refused to read back: every command afterwards insisted on
+  # 'feat-one' and rejected the name the task was created with.
+  assert_ok "the branch spelling resolves" iw --resolve-worktree-folder feat/one
+  assert_contains "to the folder it made" "/feat-one" \
+    "$(iw --resolve-worktree-folder feat/one 2>&1)"
+  assert_contains "and the flat spelling still works" "/feat-one" \
+    "$(iw --resolve-worktree-folder feat-one 2>&1)"
+}
+
+test_a_name_with_a_slash_says_what_the_folder_would_be() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # Nothing by that name exists either way, but the message now says what the
+  # folder for it would be called instead of only that a slash is wrong.
+  assert_contains "it names the flattened spelling" "'review-vignirs-prs'" \
+    "$(iw --no-tmux rm -f review/vignirs/prs 2>&1; iw --resolve-worktree-folder review/vignirs-prs 2>&1)"
+}
+
 # --- update ------------------------------------------------------------------
 
 # The suite's default claude stub exits at once, which is the shape of a *dead*
@@ -3978,6 +4079,27 @@ bump_version_command() {
 # send-keys returns before the agent has started, and update-agents works out
 # which agent a pane runs from the process in front of it -- so a test that does
 # not wait finds no agents at all.
+# send-keys returns before the shell has run anything, so a pane read straight
+# afterwards is empty. Poll for the text instead.
+pane_text_eventually() {
+  local target="$1" needle="$2" pane="" waited=0 out=""
+
+  pane="$(tmux_t list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | head -1)"
+  [[ -n "$pane" ]] || return 1
+
+  while (( waited < 60 )); do
+    out="$(tmux_t capture-pane -p -t "$pane" 2>/dev/null)"
+    case "$out" in
+      *"$needle"*) printf '%s' "$out"; return 0 ;;
+    esac
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  printf '%s' "$out"
+  return 1
+}
+
 wait_for_agent() {
   local pane=""
   pane="$(tmux_t list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | head -1)"
