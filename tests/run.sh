@@ -3247,6 +3247,51 @@ test_rm_from_another_window_still_kills_immediately() {
   assert_no_file "and the task folder is gone" "$SB_TASKS/feat-one"
 }
 
+# --- a task whose repos disagree ---------------------------------------------
+
+# remove_worktrees reads the task's branch so it can record it in the project
+# history. That read dies when the repos are on different branches -- and the
+# die used to take the whole process with it, because 'die' calls exit, which
+# terminates a command substitution's subshell rather than returning a status
+# that the '|| true' inside it could catch.
+
+test_rm_works_on_a_task_whose_repos_disagree() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend -p myproj >/dev/null 2>&1
+  git -C "$SB_TASKS/feat-one/frontend" checkout -q -b feat/went-its-own-way
+
+  # It printed its plan, asked, and exited having removed nothing and said
+  # nothing -- 2>/dev/null had eaten the one sentence that explained it.
+  assert_ok "rm removes it anyway" iw rm -f feat-one
+  assert_no_file "and the task is gone" "$SB_TASKS/feat-one"
+  assert_dir "while the project it was in survives" "$SB_PROJECTS/myproj"
+}
+
+test_project_delete_cascade_survives_a_mixed_branch_task() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend -p myproj >/dev/null 2>&1
+  git -C "$SB_TASKS/feat-one/frontend" checkout -q -b feat/went-its-own-way
+
+  # The same read, reached through the cascade: this is how it was found.
+  assert_ok "the cascade completes" iw project delete -rf myproj
+  assert_no_file "the task is gone" "$SB_TASKS/feat-one"
+  assert_no_file "and so is the project" "$SB_PROJECTS/myproj"
+}
+
+test_a_mixed_branch_task_is_still_removable_without_a_project() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend >/dev/null 2>&1
+  git -C "$SB_TASKS/feat-one/frontend" checkout -q -b feat/went-its-own-way
+
+  # Unattached tasks never reached the branch read at all, which is why this
+  # went unnoticed: it only bit tasks that belonged to a project.
+  assert_ok "rm removes it" iw rm -f feat-one
+  assert_no_file "and the task is gone" "$SB_TASKS/feat-one"
+}
+
 # --- files nobody claimed ----------------------------------------------------
 
 # An agent that writes a note at the task root rather than inside a repo used to
