@@ -1132,7 +1132,7 @@ Set `IWORK_BIG=1` in your config to make every task work this way.
 
 Tasks are one way into the code; the repos themselves are the other. `iwork
 repos` keeps a session (`repos` by default) with **at least one window per repo**
-in `IWORK_REPO_DIR`, named after the repo and split into two shells:
+it covers, named after the repo and split into two shells:
 
 ```
 session repos
@@ -1140,6 +1140,30 @@ session repos
 |- window "frontend"              shell | shell
 '- window "scratch"               yours: iwork never touches it
 ```
+
+### Which repos it covers
+
+Unset, `IWORK_REPOS` means **every** repo in `IWORK_REPO_DIR` — which on a
+machine with two dozen of them is two dozen windows, most for work nobody is
+doing. Name the ones you actually work in:
+
+```sh
+IWORK_REPOS="rent-api rent-frontend-v2 accounting-api"
+```
+
+Or name them for a single run, which **adds** to the session rather than
+replacing what is in it:
+
+```bash
+iwork repos landreg          # and landreg
+iwork repos -n               # what it would open, first
+```
+
+A name in `IWORK_REPOS` that is not a repo is reported rather than quietly
+skipped — a typo there otherwise just looks like the session being wrong. And
+when `iwork repos` is about to open more than eight windows with nothing
+configured, it says so and shows the setting, at the one moment that advice is
+worth anything.
 
 ```bash
 iwork repos        # create what is missing, then switch to it
@@ -1484,6 +1508,7 @@ overrides.
 | `IWORK_PROJECTS_DIR` | `$IWORK_REPO_DIR/projects` | Where project memory lives (see [Projects](#projects-memory-across-many-tasks)) |
 | `IWORK_TMUX_SESSION` | `tasks` | tmux session for tasks that belong to no project, and the prefix for a `--big` task's own session (`tasks-<task>`) |
 | `IWORK_PROJECTS_TMUX_SESSION` | `projects` | prefix for the session each project owns (`projects-<project>`), holding its master and its tasks (see [The master](#the-master-one-agent-whose-job-is-the-project)) |
+| `IWORK_REPOS` | every repo | Space-separated repos the `repos` session covers. Unset means all of them |
 | `IWORK_REPOS_TMUX_SESSION` | `repos` | tmux session with a window per repo (see [The repos session](#the-repos-session-a-window-per-repo)); may not be or start with the task or project session prefixes |
 | `IWORK_CONTEXT_TEMPLATE` | `~/.config/iwork/task-context.md.tmpl` | Template for the generated `CLAUDE.md`/`AGENTS.md` (seeded with a default on first use, then yours to edit) |
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |

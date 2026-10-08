@@ -155,6 +155,7 @@ iw() {
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
   [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
   [[ -n "${WANT_UPDATE_CLAUDE+x}" ]] && env_args+=(IWORK_UPDATE_CLAUDE="$WANT_UPDATE_CLAUDE")
+  [[ -n "${WANT_REPOS+x}" ]] && env_args+=(IWORK_REPOS="$WANT_REPOS")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
@@ -4129,6 +4130,99 @@ test_update_does_not_restart_anything_when_the_update_fails() {
   assert_contains "and says so" "no agent was restarted" \
     "$(WANT_TMUX=1 WANT_UPDATE_CLAUDE="false" iw update-agents -f 2>&1)"
   assert_eq "the agent is untouched" "$before" "$(agent_pid_of '=tasks:feat-one')"
+}
+
+# --- choosing which repos get a window ---------------------------------------
+
+# 'iwork repos' opened a window for every direct child of IWORK_REPO_DIR, which
+# on a real machine was 23 of them -- most for work nobody is doing.
+
+test_repos_opens_only_the_configured_ones() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo alpha; mk_repo beta; mk_repo gamma
+
+  WANT_REPOS="alpha gamma" WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+
+  local windows
+  windows="$(tmux_t list-windows -t '=repos' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the first named repo has a window" "alpha" "$windows"
+  assert_contains "and the second" "gamma" "$windows"
+  case "$windows" in
+    *beta*) bad "a repo outside IWORK_REPOS got a window" ;;
+    *) ok ;;
+  esac
+}
+
+test_repos_still_takes_everything_when_nothing_is_configured() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo alpha; mk_repo beta
+
+  # The old behaviour is the default, so nobody who wanted it has to do
+  # anything to keep it.
+  WANT_TMUX=1 iw repos -d >/dev/null 2>&1
+  local windows
+  windows="$(tmux_t list-windows -t '=repos' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "one repo is there" "alpha" "$windows"
+  assert_contains "and so is the other" "beta" "$windows"
+}
+
+test_repos_takes_names_for_one_run() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo alpha; mk_repo beta; mk_repo gamma
+
+  WANT_TMUX=1 iw repos -d beta >/dev/null 2>&1
+  local windows
+  windows="$(tmux_t list-windows -t '=repos' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the named repo is open" "beta" "$windows"
+  case "$windows" in
+    *alpha*) bad "naming one repo opened the others too" ;;
+    *) ok ;;
+  esac
+
+  # Additive: naming another later leaves the first alone.
+  WANT_TMUX=1 iw repos -d gamma >/dev/null 2>&1
+  windows="$(tmux_t list-windows -t '=repos' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+  assert_contains "the first is still there" "beta" "$windows"
+  assert_contains "and the second joined it" "gamma" "$windows"
+}
+
+test_repos_refuses_a_name_that_is_not_a_repo() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo alpha
+
+  WANT_TMUX=1 assert_fails "an unknown repo is refused" iw repos -d nope
+  assert_contains "and says so" "no such repo" "$(WANT_TMUX=1 iw repos -d nope 2>&1)"
+}
+
+test_repos_says_when_a_configured_name_is_not_a_repo() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo alpha
+
+  # A typo in the config would otherwise just quietly take a repo out of the
+  # session, which looks like the session being wrong rather than the config.
+  assert_contains "the bad name is named" "names 'nope'" \
+    "$(WANT_REPOS="alpha nope" WANT_TMUX=1 iw repos -n 2>&1)"
+}
+
+test_repos_mentions_the_setting_when_it_would_open_a_lot() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local i
+  for i in 1 2 3 4 5 6 7 8 9; do mk_repo "repo$i"; done
+
+  # Said on the dry run, which is the run you would do first.
+  assert_contains "it offers the way to scope it" "IWORK_REPOS" \
+    "$(WANT_TMUX=1 iw repos -n 2>&1)"
+}
+
+test_repos_says_nothing_about_the_setting_for_a_few_repos() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo alpha; mk_repo beta
+
+  # Two repos is not a problem to solve, and the advice would just be noise.
+  case "$(WANT_TMUX=1 iw repos -n 2>&1)" in
+    *IWORK_REPOS*) bad "the scoping advice fired for two repos" ;;
+    *) ok ;;
+  esac
 }
 
 # --- repos session -------------------------------------------------------------
