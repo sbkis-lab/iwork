@@ -3,7 +3,7 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX IWORK_AGENT IWORK_AGENT_ARGS_CLAUDE IWORK_AGENT_ARGS_CODEX)
 
 load_config() {
   local var="" restore=""
@@ -51,6 +51,12 @@ IWORK_UPDATE_CLAUDE="${IWORK_UPDATE_CLAUDE:-}"
 IWORK_UPDATE_CODEX="${IWORK_UPDATE_CODEX:-}"
 IWORK_RESUME_CLAUDE="${IWORK_RESUME_CLAUDE:-}"
 IWORK_RESUME_CODEX="${IWORK_RESUME_CODEX:-}"
+# Which CLI a new task starts, and anything to hand it every time. iwork ran
+# claude and only claude: 'iwork codex <task>' could open an existing task with
+# codex, but nothing could ever create one, so a codex task was unreachable.
+IWORK_AGENT="${IWORK_AGENT:-claude}"
+IWORK_AGENT_ARGS_CLAUDE="${IWORK_AGENT_ARGS_CLAUDE:-}"
+IWORK_AGENT_ARGS_CODEX="${IWORK_AGENT_ARGS_CODEX:-}"
 IWORK_NO_TMUX="${IWORK_NO_TMUX:-}"
 IWORK_NO_CONTEXT="${IWORK_NO_CONTEXT:-}"
 IWORK_DETACH="${IWORK_DETACH:-}"
@@ -123,7 +129,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork done <todo-id> [--nth <n>] [-p <project>]
        iwork drop <todo-id> [--nth <n>] [-p <project>]
 
-       flags: [--no-tmux] [--no-context] [--detach|-d] [--big]
+       flags: [--no-tmux] [--no-context] [--detach|-d] [--big] [--agent <cli>]
               [--message|-m <message>]
 
 Create a task folder in the tasks directory and set up git worktrees for
@@ -187,6 +193,20 @@ and a session switcher that looks one up by the name it last saw will miss
 it and -- if it creates what it cannot find, as tmux-sessionx does --
 build a second session under the stale name. The hook in --tmux-config
 folds such a split back together if you want the marker anyway.
+
+Which CLI a task runs is IWORK_AGENT, 'claude' unless you say otherwise, and
+--agent <cli> overrides it for one invocation. iwork knows claude and codex.
+IWORK_AGENT_ARGS_CLAUDE and IWORK_AGENT_ARGS_CODEX are handed to that CLI on
+every start, so a flag you always want lives in the config rather than in your
+fingers. A project's master is always claude: its brief arrives through the
+Claude SessionStart hook, and nothing else reads it.
+
+'iwork claude <task>' and 'iwork codex <task>' still name the CLI themselves,
+for a task that already exists.
+
+A task argument may be spelled either way: a task folder is its branch with
+the slashes flattened, so 'review/vignirs-prs' and 'review-vignirs-prs' both
+find the same task.
 
 -m <message> hands the agent the message as its first prompt, so a new task
 starts working the moment it comes up instead of waiting for you to type it.
@@ -552,9 +572,46 @@ reject_trailing_message_flag() {
   done
 }
 
+validate_agent_name() {
+  local agent="$1"
+
+  case "$agent" in
+    claude|codex) ;;
+    *)
+      die "unknown agent '$agent'; iwork knows claude and codex.
+  Set IWORK_AGENT in $IWORK_CONFIG_FILE to pick the default."
+      ;;
+  esac
+}
+
+# Anything to hand this CLI on every start, from the config. Word-split on
+# purpose: it is a command line, written as one.
+agent_start_args() {
+  local agent="$1"
+  local var=""
+
+  var="IWORK_AGENT_ARGS_$(agent_config_suffix "$agent")"
+  printf '%s' "${!var:-}"
+}
+
+# How each CLI takes a first prompt, which is not the same shape twice: claude
+# reads it after a '--', codex takes it as its argument. Knowing this is iwork's
+# job rather than the operator's, so it is not config.
 agent_message_args() {
+  local agent="${1:-$IWORK_AGENT}"
+  local extra=""
+
   AGENT_ARGS=()
-  [[ -z "$INITIAL_MESSAGE" ]] || AGENT_ARGS=(-- "$INITIAL_MESSAGE")
+
+  extra="$(agent_start_args "$agent")"
+  [[ -z "$extra" ]] || AGENT_ARGS=($extra)
+
+  [[ -n "$INITIAL_MESSAGE" ]] || return 0
+
+  case "$agent" in
+    codex) AGENT_ARGS+=("$INITIAL_MESSAGE") ;;
+    *) AGENT_ARGS+=(-- "$INITIAL_MESSAGE") ;;
+  esac
 }
 
 # -m only reaches an agent that this invocation starts itself. Everywhere else
@@ -595,12 +652,29 @@ validate_repo_name() {
   fi
 }
 
+# A task's folder is its branch with the slashes flattened, which is a mapping
+# iwork invented and then only applied in one direction: 'iwork feat/x -r repo'
+# made 'feat-x', and every command afterwards insisted on 'feat-x'. Typing the
+# name you created it with got you "must be a direct child", which is true and
+# explains nothing. The mapping is iwork's own and deterministic, so it is
+# applied here too.
+task_name_from_arg() {
+  local given="$1"
+
+  case "$given" in
+    */*) printf '%s\n' "${given//\//-}" ;;
+    *) printf '%s\n' "$given" ;;
+  esac
+}
+
 validate_worktree_folder_name() {
   local folder="$1"
 
   case "$folder" in
     ""|.|..|*/*|*\\* )
-      die "folder '$folder' must be a direct child of $TASKS_DIR"
+      die "folder '$folder' must be a direct child of $TASKS_DIR.
+  A task folder is its branch with the slashes flattened, so this one would be
+  '$(printf '%s' "$folder" | tr / -)'."
       ;;
     \**|!* )
       die "folder '$folder' must not start with '*' or '!'"
@@ -718,6 +792,7 @@ resolve_worktree_folder() {
   local folder="$1"
   local folder_path=""
 
+  folder="$(task_name_from_arg "$folder")"
   validate_worktree_folder_name "$folder"
 
   folder_path="$TASKS_DIR/$folder"
@@ -898,8 +973,8 @@ park_current_repo() {
     attach_task_to_project "$folder_name" "$project" "$branch"
   fi
 
-  agent_message_args
-  open_task "$folder_name" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  agent_message_args "$IWORK_AGENT"
+  open_task "$folder_name" "$IWORK_AGENT" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
 detect_branch_from_worktree_folder() {
@@ -1474,6 +1549,12 @@ take_task_flag() {
     --no-context) IWORK_NO_CONTEXT=1; FLAG_SHIFT=1 ;;
     -d|--detach) IWORK_DETACH=1; FLAG_SHIFT=1 ;;
     --big) IWORK_BIG=1; FLAG_SHIFT=1 ;;
+    --agent)
+      [[ $# -gt 1 ]] || die "--agent needs an agent name"
+      IWORK_AGENT="$2"
+      validate_agent_name "$IWORK_AGENT"
+      FLAG_SHIFT=2
+      ;;
     --from)
       [[ $# -gt 1 ]] || die "--from needs a task or branch name"
       BASE_SPEC="$2"
@@ -1974,7 +2055,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --agent --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2193,6 +2274,7 @@ _iwork() {
       '--detach[create the task window without switching to it]' \
       '-d[create the task window without switching to it]' \
       '--big[give the task its own tmux session with a window per repo]' \
+      '--agent[which CLI the task starts: claude or codex]' \
       '--from[start the new branches from this task or branch]' \
       '-b[branch for the new worktrees (add-repo only)]' \
       '--branch[branch for the new worktrees (add-repo only)]' \
@@ -2343,6 +2425,7 @@ _iwork() {
         '--detach[create the task window without switching to it]' \
         '-d[create the task window without switching to it]' \
         '--big[give the task its own tmux session with a window per repo]' \
+      '--agent[which CLI the task starts: claude or codex]' \
         '--from[start the new branches from this task or branch]' \
         '-b[branch for the new worktrees (add-repo only)]' \
         '--branch[branch for the new worktrees (add-repo only)]' \
@@ -3435,6 +3518,7 @@ resolve_task_arg() {
   local inferred=""
 
   if [[ -n "$given" ]]; then
+    given="$(task_name_from_arg "$given")"
     validate_worktree_folder_name "$given"
     printf '%s\n' "$given"
     return 0
@@ -6643,6 +6727,9 @@ run_init() {
     echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
     echo '# IWORK_REPOS_TMUX_SESSION=repos'
     echo '# IWORK_UPDATE_COMMAND=        # how "iwork update" upgrades Claude Code'
+    echo '# IWORK_AGENT=claude          # the CLI a new task starts'
+    echo '# IWORK_AGENT_ARGS_CLAUDE=     # params handed to it every time'
+    echo '# IWORK_AGENT_ARGS_CODEX='
     echo '# IWORK_SESSION_MARKERS=off   # on = put the agent marker on session'
     echo '#                             # names too (UNSTABLE: see iwork -h)'
     echo '# IWORK_CONTEXT_TEMPLATE="$HOME/.config/iwork/task-context.md.tmpl"'
@@ -7489,7 +7576,11 @@ if [[ "${1:-}" == "master" && "${2:-}" != "-r" ]]; then
   # own link, then the project you are standing in, then IWORK_PROJECT.
   resolve_project_context "$master_project"
 
-  agent_message_args
+  # A master stays claude whatever IWORK_AGENT says: its brief arrives through
+  # the Claude SessionStart hook, so a codex master would come up as an ordinary
+  # agent sitting in a directory of markdown, which is the thing start_master
+  # already warns about when the hooks are missing.
+  agent_message_args claude
   start_master "$RESOLVED_PROJECT"
   exit 0
 fi
@@ -7500,7 +7591,7 @@ if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
   fi
 
   reject_trailing_message_flag claude "${@:3}"
-  agent_message_args
+  agent_message_args claude
   run_tool_in_worktree claude "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
 
@@ -7510,7 +7601,7 @@ if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
   fi
 
   reject_trailing_message_flag codex "${@:3}"
-  agent_message_args
+  agent_message_args codex
   run_tool_in_worktree codex "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
 
@@ -7559,5 +7650,5 @@ if [[ -n "$PROJECT_FLAG" ]]; then
   attach_task_to_project "$folder_name" "$PROJECT_FLAG" "$branch"
 fi
 
-agent_message_args
-open_task "$folder_name" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+agent_message_args "$IWORK_AGENT"
+open_task "$folder_name" "$IWORK_AGENT" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}

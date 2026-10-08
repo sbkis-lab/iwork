@@ -861,6 +861,70 @@ session you start by hand *inside* a worktree is rooted there and sees that
 repo's skills only — the same as any ordinary checkout. Run agents from the task
 root and everything is in scope.
 
+## Which CLI a task runs
+
+iwork ran `claude`, and only `claude`. `iwork codex <task>` could open a task
+that already existed, but nothing could create one — so a codex task was a thing
+you could not get to:
+
+```
+$ iwork codex review/vignirs-prs -r accounting-api finance-frontend
+Error: folder 'review/vignirs-prs' must be a direct child of ~/dev/projects/tasks
+```
+
+Two separate problems in one line: `codex <task>` opens an existing task rather
+than creating one, and the task argument was being read as a folder name when it
+was written as a branch.
+
+### The default, and the exceptions
+
+```sh
+IWORK_AGENT=claude              # what a new task starts
+IWORK_AGENT_ARGS_CLAUDE=        # handed to it on every start
+IWORK_AGENT_ARGS_CODEX=
+```
+
+`--agent <cli>` overrides the default for one invocation:
+
+```bash
+iwork --agent codex review/vignirs-prs -r accounting-api finance-frontend
+```
+
+A flag you always want belongs in the config rather than in your fingers:
+
+```sh
+IWORK_AGENT_ARGS_CODEX="--full-auto"
+```
+
+iwork knows `claude` and `codex`; anything else is refused by name rather than
+failing later with whatever that binary says about arguments it did not expect.
+
+A **first prompt** is shaped for the CLI it goes to — `claude` reads it after a
+`--`, `codex` takes it as its argument. That is iwork's job to know, not yours,
+so `-m` works the same either way:
+
+```bash
+iwork --agent codex fix/login -r auth-service -m 'Sentry AUTH-42: why does login 500?'
+```
+
+A project's **master is always claude**, whatever `IWORK_AGENT` says: its brief
+arrives through the Claude `SessionStart` hook, and nothing else reads it.
+
+### Naming a task the way you created it
+
+A task folder is its branch with the slashes flattened — `feat/login-bug`
+becomes `feat-login-bug`. That mapping was only ever applied in one direction,
+so typing the name you created the task with got you "must be a direct child",
+which is true and explains nothing. Both spellings work now:
+
+```bash
+iwork codex feat/login-bug      # the branch
+iwork codex feat-login-bug      # the folder
+```
+
+And when a name really has nowhere to go, the error says what the folder for it
+would have been called.
+
 ## Branch tracking
 
 A task branch is created from `origin/main` (or whatever `origin/HEAD` points at),
@@ -1489,6 +1553,8 @@ overrides.
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
 | `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
+| `IWORK_AGENT` | `claude` | The CLI a new task starts. `claude` or `codex`; `--agent <cli>` overrides it per invocation |
+| `IWORK_AGENT_ARGS_CLAUDE`, `IWORK_AGENT_ARGS_CODEX` | empty | Params handed to that CLI every time iwork starts it |
 | `IWORK_UPDATE_CLAUDE`, `IWORK_UPDATE_CODEX` | detected | The command `iwork update-agents` runs to upgrade that agent. Empty means work it out from where its binary lives |
 | `IWORK_RESUME_CLAUDE`, `IWORK_RESUME_CODEX` | per agent | How that agent is told to resume. Defaults to `claude --continue` and `codex resume --last` |
 | `IWORK_SESSION_MARKERS` | `off` | **Unstable.** `on` writes the agent marker into session *names* as well as window names. Makes session names unstable for every other tool — see [Session state without renaming](#session-state-without-renaming) |
