@@ -155,6 +155,8 @@ iw() {
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
   [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
   [[ -n "${WANT_UPDATE_CLAUDE+x}" ]] && env_args+=(IWORK_UPDATE_CLAUDE="$WANT_UPDATE_CLAUDE")
+  [[ -n "${WANT_GROUP_STACK:-}" ]] && env_args+=(IWORK_REPO_GROUP_STACK="$WANT_GROUP_STACK")
+  [[ -n "${WANT_GROUP_RENT_STACK:-}" ]] && env_args+=(IWORK_REPO_GROUP_RENT_STACK="$WANT_GROUP_RENT_STACK")
   [[ -n "${WANT_AGENT:-}" ]] && env_args+=(IWORK_AGENT="$WANT_AGENT")
   [[ -n "${WANT_AGENT_ARGS_CODEX:-}" ]] && env_args+=(IWORK_AGENT_ARGS_CODEX="$WANT_AGENT_ARGS_CODEX")
 
@@ -3230,6 +3232,114 @@ test_config_path_prints_the_file() {
 test_config_rejects_a_subcommand_it_does_not_have() {
   assert_fails "an unknown subcommand is refused" iw config frobnicate
   assert_contains "with the usage" "iwork config" "$(iw config frobnicate 2>&1)"
+}
+
+# --- repo groups --------------------------------------------------------------
+
+# A combination you keep typing gets a name. The '@' is what keeps it
+# unambiguous: a group and a repo are allowed to share a name.
+
+test_a_group_stands_for_its_repos() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+
+  WANT_GROUP_STACK="backend frontend" iw feat/one -r @stack >/dev/null 2>&1
+
+  assert_dir "the first member is there" "$SB_TASKS/feat-one/backend"
+  assert_dir "and the second" "$SB_TASKS/feat-one/frontend"
+  assert_no_file "and nothing else" "$SB_TASKS/feat-one/shared"
+}
+
+test_a_group_combines_with_plain_repos_without_repeating() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+
+  # '-r @stack backend shared' is the group plus what it did not already
+  # include, not a list with backend in it twice.
+  WANT_GROUP_STACK="backend frontend" \
+    iw feat/one -r @stack backend shared >/dev/null 2>&1
+
+  assert_dir "the group came in" "$SB_TASKS/feat-one/backend"
+  assert_dir "with the rest of it" "$SB_TASKS/feat-one/frontend"
+  assert_dir "and the extra repo" "$SB_TASKS/feat-one/shared"
+}
+
+test_an_unknown_group_says_how_to_define_it() {
+  mk_repo backend
+
+  local out
+  out="$(WANT_GROUP_STACK="backend" iw feat/one -r @nope 2>&1)"
+  assert_contains "it names the group" "no repo group 'nope'" "$out"
+  assert_contains "and the variable to set" 'IWORK_REPO_GROUP_NOPE=' "$out"
+  # The one thing you want when you have mistyped a name is the list of real
+  # ones.
+  assert_contains "and the groups that do exist" "stack" "$out"
+  assert_no_file "nothing was created" "$SB_TASKS/feat-one"
+}
+
+test_a_bare_at_sign_is_refused() {
+  mk_repo backend
+  assert_fails "'@' alone is refused" iw feat/one -r @
+  assert_contains "and says what it wants" "needs a group name" \
+    "$(iw feat/one -r @ 2>&1)"
+}
+
+test_a_group_name_may_have_a_dash() {
+  mk_repo backend
+  mk_repo frontend
+
+  # '@rent-stack' reads from IWORK_REPO_GROUP_RENT_STACK: the same name mapping
+  # the per-agent settings use.
+  WANT_GROUP_RENT_STACK="backend frontend" iw feat/one -r @rent-stack >/dev/null 2>&1
+  assert_dir "the dashed name resolved" "$SB_TASKS/feat-one/backend"
+  assert_dir "to both repos" "$SB_TASKS/feat-one/frontend"
+}
+
+test_add_repo_takes_a_group() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+  iw feat/one -r shared >/dev/null 2>&1
+
+  WANT_GROUP_STACK="backend frontend" iw add-repo feat-one -r @stack >/dev/null 2>&1
+  assert_dir "the group was added" "$SB_TASKS/feat-one/backend"
+  assert_dir "all of it" "$SB_TASKS/feat-one/frontend"
+  assert_dir "beside what was there" "$SB_TASKS/feat-one/shared"
+}
+
+test_add_repo_skips_what_the_task_already_has() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # Groups make partial overlap the ordinary case: '-r @stack' on a task that
+  # already has one member used to fail outright, so the shorthand broke the
+  # second time you used it.
+  local out
+  out="$(WANT_GROUP_STACK="backend frontend" iw add-repo feat-one -r @stack 2>&1)"
+  assert_contains "the one already there is named" "backend: already in this task" "$out"
+  assert_dir "and the missing one is added" "$SB_TASKS/feat-one/frontend"
+}
+
+test_add_repo_of_only_repos_already_present_does_nothing() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  local out
+  out="$(iw add-repo feat-one -r backend 2>&1)"
+  assert_contains "it says there is nothing to do" "Nothing to add" "$out"
+  assert_dir "and the task is unchanged" "$SB_TASKS/feat-one/backend"
+}
+
+test_groups_complete_alongside_repos() {
+  mk_repo backend
+
+  local out
+  out="$(WANT_GROUP_STACK="backend" iw --complete-repos 2>&1)"
+  assert_contains "a real repo is offered" "backend" "$out"
+  assert_contains "and the group, with its sigil" "@stack" "$out"
 }
 
 # --- rm from inside the thing being killed ------------------------------------
