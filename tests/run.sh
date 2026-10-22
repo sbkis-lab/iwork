@@ -3115,6 +3115,123 @@ test_resurrect_rejects_an_unknown_argument() {
   assert_contains "with the usage line" "iwork resurrect" "$(iw resurrect feat-one 2>&1)"
 }
 
+# --- the config command -------------------------------------------------------
+
+# The config file is plain shell and always has been, which is fine until you
+# want to change one thing: you open it, hope you remember the setting's name,
+# and find out whether you got it right the next time something breaks.
+
+test_config_lists_what_you_are_actually_getting() {
+  local out
+  out="$(iw config 2>&1)"
+
+  assert_contains "it names the file" "$SB/config" "$out"
+  assert_contains "a setting from the file is marked as such" "config" "$out"
+  # TASKS_DIR is derived from REPO_DIR when unset, so printing the raw variable
+  # would report it as unset -- the opposite of what this is for.
+  assert_contains "a derived setting shows its effective value" "$SB_TASKS" "$out"
+}
+
+test_config_get_takes_any_spelling_of_the_name() {
+  assert_eq "the full name" "claude" "$(iw config get IWORK_AGENT)"
+  assert_eq "without the prefix" "claude" "$(iw config get agent)"
+  assert_eq "and in any case" "claude" "$(iw config get AGENT)"
+}
+
+test_config_get_refuses_a_setting_that_does_not_exist() {
+  assert_fails "an unknown setting is refused" iw config get nonsense
+  assert_contains "and the real ones are listed" "AGENT" \
+    "$(iw config get nonsense 2>&1)"
+}
+
+test_config_set_writes_the_file_and_keeps_the_rest_of_it() {
+  printf '# a comment of my own\n' >> "$SB/config"
+
+  iw config set agent codex >/dev/null 2>&1
+
+  assert_grep "the setting is written" 'IWORK_AGENT="codex"' "$SB/config"
+  assert_grep "and what was already there stays" 'a comment of my own' "$SB/config"
+  assert_eq "and reading it back agrees" "codex" "$(iw config get agent)"
+}
+
+test_config_set_replaces_a_commented_example_in_place() {
+  printf '# IWORK_SHOW_LOG_LINES=12      # how many entries project show prints\n' >> "$SB/config"
+
+  iw config set show-log-lines 20 >/dev/null 2>&1
+
+  assert_grep "the example became the setting" '^IWORK_SHOW_LOG_LINES="20"' "$SB/config"
+  # The sentence next to a commented example is usually the only documentation
+  # of what the setting does.
+  assert_grep "and kept the sentence beside it" 'how many entries' "$SB/config"
+  assert_eq "it is not written twice" "1" \
+    "$(grep -c 'IWORK_SHOW_LOG_LINES' "$SB/config" | tr -d ' ')"
+}
+
+test_config_set_checks_the_value() {
+  assert_fails "an agent iwork does not know is refused" iw config set agent emacs
+  assert_contains "and says what it knows" "knows claude and codex" \
+    "$(iw config set agent emacs 2>&1)"
+
+  assert_fails "a non-numeric line count is refused" iw config set show-log-lines lots
+  assert_contains "and says what it wants" "positive integer" \
+    "$(iw config set show-log-lines lots 2>&1)"
+
+  # Checking here is the point: the alternative is finding out it was wrong the
+  # next time the setting is used.
+  assert_no_grep "nothing was written" "emacs" "$SB/config"
+}
+
+test_config_unset_removes_it() {
+  iw config set agent codex >/dev/null 2>&1
+  assert_grep "it is there first" 'IWORK_AGENT="codex"' "$SB/config"
+
+  iw config unset agent >/dev/null 2>&1
+  assert_no_grep "and gone after" 'IWORK_AGENT="codex"' "$SB/config"
+  assert_fails "unsetting it twice says so" iw config unset agent
+}
+
+test_config_warns_when_the_environment_wins() {
+  # Writing a setting the environment overrides looks like it worked and then
+  # does nothing, which is the worst way to find out.
+  assert_contains "it says the environment wins" "wins over the file" \
+    "$(WANT_AGENT=codex iw config set agent claude 2>&1)"
+}
+
+test_config_group_set_and_rm() {
+  mk_repo backend
+  mk_repo frontend
+
+  iw config group set claims backend frontend >/dev/null 2>&1
+  assert_grep "the group is written" 'IWORK_REPO_GROUP_CLAIMS="backend frontend"' "$SB/config"
+
+  assert_contains "and listed back" "@claims" "$(iw config group 2>&1)"
+  assert_contains "with its repos" "backend frontend" "$(iw config group 2>&1)"
+
+  iw config group rm claims >/dev/null 2>&1
+  assert_no_grep "and removed" 'IWORK_REPO_GROUP_CLAIMS' "$SB/config"
+  assert_fails "removing it twice says so" iw config group rm claims
+}
+
+test_config_group_set_warns_about_a_repo_that_is_not_there() {
+  mk_repo backend
+
+  # Still written: naming a repo you are about to clone is reasonable, so this
+  # is a warning rather than a refusal.
+  local out
+  out="$(iw config group set claims backend nope 2>&1)"
+  assert_contains "the unknown repo is named" "'nope' is not a repo" "$out"
+  assert_grep "and the group is still written" 'IWORK_REPO_GROUP_CLAIMS' "$SB/config"
+}
+
+test_config_path_prints_the_file() {
+  assert_eq "it prints the config path" "$SB/config" "$(iw config path)"
+}
+
+test_config_rejects_a_subcommand_it_does_not_have() {
+  assert_fails "an unknown subcommand is refused" iw config frobnicate
+  assert_contains "with the usage" "iwork config" "$(iw config frobnicate 2>&1)"
+}
+
 # --- rm from inside the thing being killed ------------------------------------
 
 # iw() runs iwork outside tmux, which can never reach the case these cover: the

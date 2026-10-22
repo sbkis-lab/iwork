@@ -5,16 +5,24 @@ SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
 IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX IWORK_AGENT IWORK_AGENT_ARGS_CLAUDE IWORK_AGENT_ARGS_CODEX)
 
+# Names that arrived from the environment rather than the config file, filled
+# in by load_config and read only by 'iwork config'.
+IWORK_FROM_ENV=""
+
 load_config() {
   local var="" restore=""
 
   [[ -f "$IWORK_CONFIG_FILE" ]] || return 0
 
   # Environment variables win over the config file: remember what came from
-  # the environment, source the config, then put those values back.
+  # the environment, source the config, then put those values back. The names
+  # are kept as well, so 'iwork config' can say which of these you are actually
+  # getting and from where, rather than printing a value and leaving you to
+  # work out why the file disagrees with it.
   for var in "${IWORK_CONFIG_VARS[@]}"; do
     if [[ -n "${!var+x}" ]]; then
       restore="$restore $var=$(printf '%q' "${!var}");"
+      IWORK_FROM_ENV="$IWORK_FROM_ENV $var"
     fi
   done
 
@@ -109,6 +117,8 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork update-agents [-n] [-f] [--busy] [--restart]
        iwork resurrect [-n] [--fresh] [--big <task>]...
        iwork repos [-n] [-d]
+       iwork config [list | get <setting> | set <setting> <value>
+                    | unset <setting> | group ... | path | edit]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
@@ -251,6 +261,16 @@ knows that work is already in its history: the template can place it with a
 section instead.
 
 Subcommands:
+  config         Read and change the config file without opening it. 'config'
+                 lists every setting with the value you are actually getting
+                 and where it came from -- the file, the environment, or a
+                 default. 'get'/'set'/'unset' take the name in any case and
+                 with or without the IWORK_ prefix, check the value before
+                 writing it, and leave the rest of the file alone, replacing a
+                 commented example in place rather than appending past it.
+                 'config group set <name> <repo>...' names a repo combination
+                 for -r @<name>; 'group' lists them, 'group rm' removes one.
+                 'path' prints the file, 'edit' opens it in $EDITOR
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
   skills         Relink .claude/skills for every task, or just the named one;
@@ -2064,7 +2084,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --agent --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents config project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --agent --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2276,6 +2296,7 @@ _iwork() {
       'decided[record a decision in the project log]' \
       'done[close a captured todo by id]' \
       'drop[abandon a captured todo by id]' \
+      'config[read and change the config file]' \
       'init[create the iwork config file]' \
       'install-hooks[install Claude Code status hooks]' \
       '--no-tmux[skip tmux window handling]' \
@@ -4252,6 +4273,371 @@ cmd_cull() {
   fi
 
   (( kept == 0 )) || echo "Kept tasks hold work git cannot give back; removing those is 'iwork rm'."
+}
+
+# --- config ------------------------------------------------------------------
+
+# The config file is plain shell and always has been, which is fine until you
+# want to change one thing in it: you open it, hope you remember the name of the
+# setting, and find out whether you got it right the next time something breaks.
+# 'iwork config' is the same file, with the names and the checking built in.
+
+config_key_known() {
+  local key="$1"
+  local known=""
+
+  case "$key" in
+    IWORK_REPO_GROUP_?*) return 0 ;;
+  esac
+
+  for known in "${IWORK_CONFIG_VARS[@]}"; do
+    [[ "$known" != "$key" ]] || return 0
+  done
+
+  return 1
+}
+
+# Accepts the name as written in the file, in any case, and with the IWORK_
+# prefix left off -- 'agent', 'AGENT' and 'IWORK_AGENT' are the same setting,
+# because remembering which of those it was is the thing this command exists to
+# stop you doing.
+config_key_from_arg() {
+  local given="$1"
+  local key=""
+
+  key="$(printf '%s' "$given" | tr '[:lower:]-' '[:upper:]_')"
+  case "$key" in
+    IWORK_*) ;;
+    *) key="IWORK_$key" ;;
+  esac
+
+  config_key_known "$key" || return 1
+  printf '%s\n' "$key"
+}
+
+config_keys_hint() {
+  printf '  Settings: %s\n' "$(printf '%s ' "${IWORK_CONFIG_VARS[@]}" | sed 's/IWORK_//g')"
+  printf '  plus IWORK_REPO_GROUP_<NAME> for a repo group.\n'
+}
+
+# What the file itself says, as opposed to what the value ended up being.
+config_file_value() {
+  local key="$1"
+  local line=""
+
+  [[ -f "$IWORK_CONFIG_FILE" ]] || return 1
+
+  line="$(grep -E "^[[:space:]]*$key=" "$IWORK_CONFIG_FILE" 2>/dev/null | tail -1)" || return 1
+  [[ -n "$line" ]] || return 1
+
+  line="${line#*=}"
+  # Unwrap one layer of quoting, which is how this command writes them.
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+
+  printf '%s\n' "$line"
+}
+
+config_from_env() {
+  case " $IWORK_FROM_ENV " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Rewrites one assignment in place, keeping everything else in the file exactly
+# where it was. A commented example is replaced rather than appended past, so a
+# config written by 'iwork init' stays the shape it was written in instead of
+# growing a second copy of every setting at the bottom.
+config_file_write() {
+  local key="$1"
+  local value="$2"
+  local tmp=""
+  local line=""
+  local done=""
+  local rendered=""
+  local trailer=""
+
+  printf -v rendered '%s="%s"' "$key" "$(config_escape "$value")"
+
+  mkdir -p "$(dirname "$IWORK_CONFIG_FILE")" 2>/dev/null ||
+    die "could not create $(dirname "$IWORK_CONFIG_FILE")"
+  [[ -f "$IWORK_CONFIG_FILE" ]] || : > "$IWORK_CONFIG_FILE"
+
+  tmp="$IWORK_CONFIG_FILE.iwork-tmp.$$"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$done" ]] && [[ "$line" =~ ^[[:space:]]*#?[[:space:]]*$key= ]]; then
+      # A commented example usually carries the sentence that says what the
+      # setting is for. Replacing the line should not cost you that.
+      trailer=""
+      [[ "$line" =~ [[:space:]](#[^\"\']*)$ ]] && trailer="   ${BASH_REMATCH[1]}"
+      printf '%s%s\n' "$rendered" "$trailer"
+      done=1
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$IWORK_CONFIG_FILE" > "$tmp"
+
+  [[ -n "$done" ]] || printf '%s\n' "$rendered" >> "$tmp"
+
+  mv "$tmp" "$IWORK_CONFIG_FILE" || { rm -f "$tmp"; die "could not write $IWORK_CONFIG_FILE"; }
+}
+
+config_file_remove() {
+  local key="$1"
+  local tmp=""
+  local line=""
+  local found=""
+
+  [[ -f "$IWORK_CONFIG_FILE" ]] || return 1
+
+  tmp="$IWORK_CONFIG_FILE.iwork-tmp.$$"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*$key= ]]; then
+      found=1
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$IWORK_CONFIG_FILE" > "$tmp"
+
+  [[ -n "$found" ]] || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$IWORK_CONFIG_FILE" || { rm -f "$tmp"; die "could not write $IWORK_CONFIG_FILE"; }
+}
+
+# The file is sourced, so a value goes in double quotes and anything that would
+# mean something inside them is escaped.
+config_escape() {
+  local value="$1"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '%s' "$value"
+}
+
+# Checking a value here is the point: the alternative is finding out it was
+# wrong the next time the setting is used, which for half of these is a command
+# that then does nothing and does not say why.
+validate_config_value() {
+  local key="$1"
+  local value="$2"
+  local repo=""
+
+  case "$key" in
+    IWORK_AGENT)
+      validate_agent_name "$value"
+      ;;
+    IWORK_REPO_DIR|IWORK_TASKS_DIR|IWORK_PROJECTS_DIR)
+      [[ -d "$value" ]] || warn "$key is not a directory yet: $value"
+      ;;
+    IWORK_SHOW_LOG_LINES)
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$key must be a positive integer, got '$value'"
+      ;;
+    IWORK_SESSION_MARKERS)
+      case "$value" in
+        on|off|1|0|yes|no|true|false) ;;
+        *) die "$key is on or off, got '$value'" ;;
+      esac
+      ;;
+    IWORK_TMUX_SESSION|IWORK_PROJECTS_TMUX_SESSION|IWORK_REPOS_TMUX_SESSION)
+      case "$value" in
+        ""|*:*|*.*) die "$key may not be empty or contain ':' or '.'" ;;
+      esac
+      ;;
+    IWORK_REPO_GROUP_*)
+      [[ -n "$value" ]] || die "a repo group needs at least one repo"
+      for repo in $value; do
+        validate_repo_name "$repo"
+        [[ -d "$REPO_DIR/$repo" ]] || warn "'$repo' is not a repo in $REPO_DIR"
+      done
+      ;;
+  esac
+}
+
+config_group_name_from_key() {
+  printf '%s' "${1#IWORK_REPO_GROUP_}" | tr '[:upper:]_' '[:lower:]-'
+}
+
+# Several settings are read once into a working variable with a default or a
+# derivation applied -- TASKS_DIR is REPO_DIR/tasks unless you said otherwise.
+# Printing the raw IWORK_ variable would report those as unset, which is the
+# opposite of what this command is for: what you are actually getting.
+config_effective_value() {
+  local key="$1"
+  local runtime=""
+
+  case "$key" in
+    IWORK_REPO_DIR) runtime="REPO_DIR" ;;
+    IWORK_TASKS_DIR) runtime="TASKS_DIR" ;;
+    IWORK_PROJECTS_DIR) runtime="PROJECTS_DIR" ;;
+    IWORK_TMUX_SESSION) runtime="TASKS_SESSION" ;;
+    IWORK_PROJECTS_TMUX_SESSION) runtime="PROJECTS_SESSION" ;;
+    IWORK_REPOS_TMUX_SESSION) runtime="REPOS_SESSION" ;;
+    IWORK_CONTEXT_TEMPLATE) runtime="CONTEXT_TEMPLATE" ;;
+    IWORK_PROJECT_TEMPLATE) runtime="PROJECT_TEMPLATE" ;;
+    IWORK_SHOW_LOG_LINES) runtime="SHOW_LOG_LINES" ;;
+    *) runtime="$key" ;;
+  esac
+
+  printf '%s' "${!runtime:-}"
+}
+
+config_show_all() {
+  local key=""
+  local value=""
+  local source=""
+  local width=0
+
+  for key in "${IWORK_CONFIG_VARS[@]}"; do
+    (( ${#key} <= width )) || width=${#key}
+  done
+
+  echo "$IWORK_CONFIG_FILE"
+  echo ""
+
+  for key in "${IWORK_CONFIG_VARS[@]}"; do
+    value="$(config_effective_value "$key")"
+
+    if config_from_env "$key"; then
+      source="environment"
+    elif config_file_value "$key" >/dev/null 2>&1; then
+      source="config"
+    elif [[ -n "$value" ]]; then
+      source="default"
+    else
+      source=""
+    fi
+
+    printf '%-*s  %-28s %s\n' "$width" "$key" "${value:--}" "$source"
+  done
+
+  config_show_groups
+}
+
+config_show_groups() {
+  local name=""
+  local var=""
+  local any=""
+
+  while IFS= read -r var; do
+    [[ -n "$var" ]] || continue
+    [[ -n "${!var:-}" ]] || continue
+    [[ -n "$any" ]] || { echo ""; echo "Repo groups:"; any=1; }
+    name="$(config_group_name_from_key "$var")"
+    printf '  @%-20s %s\n' "$name" "${!var}"
+  done < <(compgen -v 2>/dev/null | grep '^IWORK_REPO_GROUP_' | sort)
+
+  [[ -n "$any" ]] || { echo ""; echo "No repo groups. 'iwork config group set <name> <repo>...' makes one."; }
+}
+
+cmd_config_group() {
+  local sub="${1:-list}"
+  local name=""
+  local key=""
+
+  case "$sub" in
+    list|"")
+      require_config
+      config_show_groups
+      ;;
+    set)
+      shift
+      name="${1:-}"
+      shift || true
+      [[ -n "$name" && $# -gt 0 ]] ||
+        die "usage: iwork config group set <name> <repo> [repo ...]"
+      require_config
+      key="IWORK_REPO_GROUP_$(printf '%s' "$name" | tr '[:lower:]-' '[:upper:]_')"
+      validate_config_value "$key" "$*"
+      config_file_write "$key" "$*"
+      echo "Set @$name = $*"
+      echo "  in $IWORK_CONFIG_FILE"
+      ;;
+    rm|unset)
+      shift
+      name="${1:-}"
+      [[ -n "$name" ]] || die "usage: iwork config group rm <name>"
+      require_config
+      key="IWORK_REPO_GROUP_$(printf '%s' "$name" | tr '[:lower:]-' '[:upper:]_')"
+      config_file_remove "$key" || die "no repo group '$name' in $IWORK_CONFIG_FILE"
+      echo "Removed @$name"
+      ;;
+    *)
+      die "usage: iwork config group [list | set <name> <repo>... | rm <name>]"
+      ;;
+  esac
+}
+
+cmd_config() {
+  local sub="${1:-}"
+  local key=""
+  local value=""
+
+  case "$sub" in
+    ""|list)
+      require_config
+      config_show_all
+      ;;
+    path)
+      printf '%s\n' "$IWORK_CONFIG_FILE"
+      ;;
+    edit)
+      [[ -n "${EDITOR:-${VISUAL:-}}" ]] ||
+        die "no EDITOR or VISUAL set; the file is $IWORK_CONFIG_FILE"
+      mkdir -p "$(dirname "$IWORK_CONFIG_FILE")" 2>/dev/null || true
+      exec ${EDITOR:-$VISUAL} "$IWORK_CONFIG_FILE"
+      ;;
+    group|groups)
+      shift
+      cmd_config_group "$@"
+      ;;
+    get)
+      shift
+      [[ $# -eq 1 ]] || die "usage: iwork config get <setting>"
+      key="$(config_key_from_arg "$1")" || die "no such setting: $1
+$(config_keys_hint)"
+      printf '%s\n' "$(config_effective_value "$key")"
+      ;;
+    set)
+      shift
+      [[ $# -ge 2 ]] || die "usage: iwork config set <setting> <value>"
+      key="$(config_key_from_arg "$1")" || die "no such setting: $1
+$(config_keys_hint)"
+      shift
+      value="$*"
+      require_config
+      validate_config_value "$key" "$value"
+      config_file_write "$key" "$value"
+      echo "Set $key=\"$value\""
+      echo "  in $IWORK_CONFIG_FILE"
+      # An 'if', not a '&&': the && form returns 1 when the test is false, that
+      # is the last command in this function, and 'set -e' then takes the
+      # process after it has already printed that the write succeeded.
+      if config_from_env "$key"; then
+        warn "$key is also set in your environment, which wins over the file"
+      fi
+      ;;
+    unset)
+      shift
+      [[ $# -eq 1 ]] || die "usage: iwork config unset <setting>"
+      key="$(config_key_from_arg "$1")" || die "no such setting: $1
+$(config_keys_hint)"
+      config_file_remove "$key" || die "$key is not set in $IWORK_CONFIG_FILE"
+      echo "Unset $key in $IWORK_CONFIG_FILE"
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    *)
+      die "usage: iwork config [list | get <setting> | set <setting> <value> |
+                    unset <setting> | group ... | path | edit]"
+      ;;
+  esac
 }
 
 # --- capture -----------------------------------------------------------------
@@ -7319,6 +7705,12 @@ if [[ "${1:-}" == "init" ]]; then
   fi
 
   run_init
+  exit 0
+fi
+
+if [[ "${1:-}" == "config" ]]; then
+  shift
+  cmd_config "$@"
   exit 0
 fi
 
