@@ -1569,6 +1569,79 @@ overrides.
 Leading flags `--no-tmux`, `--no-context`, `--detach` and `--big` apply
 per-invocation, e.g. `iwork --no-tmux claude feat-login-bug`.
 
+## `iwork config`: the settings, without opening the file
+
+The config file is plain shell and always has been, which is fine until you want
+to change one thing in it. You open it, hope you remember what the setting is
+called, and find out whether you got it right the next time something breaks.
+
+```bash
+iwork config                      # every setting, its value, and where it came from
+iwork config get agent
+iwork config set agent codex
+iwork config unset agent
+iwork config path                 # the file itself
+iwork config edit                 # open it in $EDITOR anyway
+```
+
+```
+~/.config/iwork/config
+
+IWORK_REPO_DIR               /Users/me/repos                 config
+IWORK_TASKS_DIR              /Users/me/repos/tasks           default
+IWORK_TMUX_SESSION           tasks                           default
+IWORK_AGENT                  codex                           environment
+...
+```
+
+Three things it does that editing the file does not:
+
+- **It shows what you are actually getting.** `IWORK_TASKS_DIR` is usually
+  nothing in the file and `$IWORK_REPO_DIR/tasks` in practice; printing the
+  variable would report it unset, which is the opposite of the point.
+- **It says where each value came from** — the file, the environment, or a
+  default. Writing a setting your environment overrides looks like it worked and
+  then does nothing, so `set` warns when that is what you just did.
+- **It checks the value before writing it.** `iwork config set agent emacs` is
+  refused with the agents that exist, rather than failing the next time you make
+  a task.
+
+Names are taken in any case and with or without the prefix, so `agent`, `AGENT`
+and `IWORK_AGENT` are the same setting.
+
+### It leaves the rest of the file alone
+
+Writing a setting rewrites one line. Everything else — your comments, your
+ordering — stays where it was. A **commented example is replaced in place**
+rather than appended past, so a file written by `iwork init` keeps its shape
+instead of growing a second copy of every setting at the bottom:
+
+```sh
+# IWORK_AGENT=claude          # the CLI a new task starts
+```
+
+becomes
+
+```sh
+IWORK_AGENT="codex"   # the CLI a new task starts
+```
+
+The sentence beside a commented example is usually the only documentation of
+what the setting does, so it is kept.
+
+### Repo groups
+
+```bash
+iwork config group                              # list them
+iwork config group set claims rent-api accounting-api
+iwork config group rm claims
+```
+
+Which is the same as writing `IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api"`
+by hand, with the name mapping done for you and the repos checked — a repo that
+is not there is named, though still written, since naming one you are about to
+clone is reasonable.
+
 ## Tests
 
 ```bash
