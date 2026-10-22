@@ -952,6 +952,77 @@ inside the worktree:
 git branch --unset-upstream
 ```
 
+## Repo groups: a name for a combination you keep typing
+
+A task usually spans the same few repos. Naming them every time is the part that
+gets old:
+
+```bash
+iwork feat/claims-x -r rent-api accounting-api contracts-api
+iwork feat/claims-y -r rent-api accounting-api contracts-api
+```
+
+Give the combination a name:
+
+```bash
+iwork config group set claims rent-api accounting-api contracts-api
+iwork config group set rent-stack rent-api rent-frontend-v2
+```
+
+which writes it to `~/.config/iwork/config`, where you can equally put it by
+hand:
+
+```sh
+IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api contracts-api"
+IWORK_REPO_GROUP_RENT_STACK="rent-api rent-frontend-v2"
+```
+
+```bash
+iwork feat/claims-x -r @claims                   # the three of them
+iwork feat/claims-x -r @claims email-templates   # and one more
+iwork add-repo feat-claims-x -r @rent-stack      # into a task that exists
+```
+
+One variable per group rather than one list of all of them: it reads as config
+rather than as a format, and it is the same shape as `IWORK_AGENT_ARGS_<CLI>`.
+A group name with a dash maps the obvious way — `@rent-stack` is
+`IWORK_REPO_GROUP_RENT_STACK`.
+
+### Why the `@`
+
+A group and a repo are allowed to share a name. Without the sigil, whichever
+happened to exist would quietly decide what you meant — and the day you add a
+repo called `claims`, every task you make with `-r claims` silently changes
+shape. `@` says which you meant, always.
+
+An unknown group is refused with the variable to set **and the groups you do
+have**, which is the thing you actually want when you have mistyped one:
+
+```
+Error: no repo group 'claim'. Define it in ~/.config/iwork/config:
+  IWORK_REPO_GROUP_CLAIM="repo-one repo-two"
+  Groups you have defined: claims rent-stack
+```
+
+### Overlap is not an error
+
+Repeats are dropped, so `-r @claims rent-api` is the group plus anything it did
+not already include.
+
+`add-repo` now **skips a repo the task already has** and says which, rather than
+failing outright:
+
+```
+  rent-api: already in this task, left alone
+  -> accounting-api (branch: feat/claims-x, from origin/main)
+```
+
+Before groups that case was a rare typo. With them it is ordinary — `-r @claims`
+into a task already holding one of the three — and dying on it would mean the
+shorthand breaks the second time you use it.
+
+Groups complete alongside repos, so `-r @<tab>` offers them.
+
 ## Stacking a task on earlier work
 
 By default a task branches from `origin/main`. `--from` starts it from earlier
@@ -1553,6 +1624,7 @@ overrides.
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
 | `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
+| `IWORK_REPO_GROUP_<NAME>` | none | A repo combination usable as `-r @<name>`, e.g. `IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api"` |
 | `IWORK_AGENT` | `claude` | The CLI a new task starts. `claude` or `codex`; `--agent <cli>` overrides it per invocation |
 | `IWORK_AGENT_ARGS_CLAUDE`, `IWORK_AGENT_ARGS_CODEX` | empty | Params handed to that CLI every time iwork starts it |
 | `IWORK_UPDATE_CLAUDE`, `IWORK_UPDATE_CODEX` | detected | The command `iwork update-agents` runs to upgrade that agent. Empty means work it out from where its binary lives |
@@ -1641,6 +1713,10 @@ Which is the same as writing `IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api"`
 by hand, with the name mapping done for you and the repos checked — a repo that
 is not there is named, though still written, since naming one you are about to
 clone is reasonable.
+
+What a group is *for* is
+[Repo groups](#repo-groups-a-name-for-a-combination-you-keep-typing): using it
+as `-r @claims` when you make a task.
 
 ## Tests
 

@@ -101,10 +101,10 @@ require_config() {
 
 usage() {
   cat <<'EOF'
-Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
-                                   [-p <project>]
+Usage: iwork [flags] <branch-name> [--from <task|branch>]
+                                   -r <repo|@group> ... [-p <project>]
        iwork add-repo [<task>] [-b <branch>] [--from <task|branch>]
-                      -r <repo1> [repo2 ...]
+                      -r <repo|@group> ...
        iwork [--no-tmux] rm [-f] <task|--current> [-r <repo1> [repo2 ...]]
        iwork [flags] park <task> [-p <project>]
        iwork cull [-n] [--all] [-p <project>] [<task> ...]
@@ -149,6 +149,23 @@ subdirectory named after the repo it comes from.
 New branches start from the base branch but get no upstream, so status and
 prompts do not report them as ahead of/behind origin/main before they are
 pushed. Use 'git push -u origin HEAD' to set a real upstream.
+
+A repo list takes '@group' as well as repo names. A group is a combination
+you keep typing, given a name in the config:
+
+  IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api contracts-api"
+  IWORK_REPO_GROUP_RENT_STACK="rent-api rent-frontend-v2"
+
+  iwork feat/x -r @claims                  the three of them
+  iwork feat/x -r @claims email-templates  and one more
+  iwork add-repo feat-x -r @rent-stack     into a task that exists
+
+The '@' is what keeps it unambiguous: a group and a repo are allowed to
+share a name, and without the sigil whichever happened to exist would
+decide what you meant. Repeats are dropped, so a group overlapping a repo
+you also named is not an error. 'add-repo' skips a repo the task already
+has and says which, since a group that overlaps is the ordinary case
+rather than a mistake.
 
 --from <task|branch> stacks a task on earlier work instead of starting from
 origin/main. Per repo, iwork uses the first of these that exists, and says
@@ -1541,6 +1558,85 @@ remove_worktrees() {
   run_deferred_kill
 }
 
+# A repo group is a name for a combination you keep typing: '-r @claims' stands
+# for the repos IWORK_REPO_GROUP_CLAIMS names. The '@' is what keeps it
+# unambiguous -- a group and a repo are allowed to share a name, and without the
+# sigil whichever happened to exist would decide what you meant.
+#
+# One variable per group rather than one list of all of them: it reads as config
+# rather than as a format, and it is the same shape as IWORK_AGENT_ARGS_<CLI>.
+# They cannot be in IWORK_CONFIG_VARS, since the names are yours, so a group set
+# in the environment does not beat one in the config file the way other settings
+# do.
+repo_group_var() {
+  printf 'IWORK_REPO_GROUP_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+}
+
+repo_group_members() {
+  local var=""
+
+  var="$(repo_group_var "$1")"
+  printf '%s' "${!var:-}"
+}
+
+list_repo_groups() {
+  local var=""
+
+  while IFS= read -r var; do
+    [[ -n "$var" ]] || continue
+    [[ -n "${!var:-}" ]] || continue
+    printf '%s\n' "$(printf '%s' "${var#IWORK_REPO_GROUP_}" | tr '[:upper:]_' '[:lower:]-')"
+  done < <(compgen -v 2>/dev/null | grep '^IWORK_REPO_GROUP_' | sort)
+}
+
+repo_groups_hint() {
+  local known=""
+
+  known="$(list_repo_groups | tr '\n' ' ')"
+  [[ -n "$known" ]] || return 0
+
+  printf '\n  Groups you have defined: %s' "${known% }"
+}
+
+# Rewrites the collected repo list with every '@group' replaced by its members,
+# in the order they were written and without repeats -- so '-r @claims rent-api'
+# is the group plus anything it did not already include, rather than a list with
+# rent-api in it twice.
+expand_repo_groups() {
+  local out=()
+  local seen=$'\n'
+  local item=""
+  local member=""
+  local members=""
+
+  for item in "${repos[@]+${repos[@]}}"; do
+    case "$item" in
+      @)
+        die "'@' needs a group name after it"
+        ;;
+      @*)
+        members="$(repo_group_members "${item#@}")"
+        [[ -n "$members" ]] ||
+          die "no repo group '${item#@}'. Define it in $IWORK_CONFIG_FILE:
+  $(repo_group_var "${item#@}")=\"repo-one repo-two\"$(repo_groups_hint)"
+
+        for member in $members; do
+          [[ "$seen" != *$'\n'"$member"$'\n'* ]] || continue
+          seen="$seen$member"$'\n'
+          out+=("$member")
+        done
+        ;;
+      *)
+        [[ "$seen" != *$'\n'"$item"$'\n'* ]] || continue
+        seen="$seen$item"$'\n'
+        out+=("$item")
+        ;;
+    esac
+  done
+
+  repos=("${out[@]+${out[@]}}")
+}
+
 parse_repos_flag() {
   local missing_flag_message="$1"
   shift
@@ -1565,6 +1661,8 @@ parse_repos_flag() {
   if [[ ${#repos[@]} -eq 0 ]]; then
     die "specify at least one repo after -r"
   fi
+
+  expand_repo_groups
 }
 
 # Consumes one flag from the front of "$@" and reports how many arguments it
@@ -1639,6 +1737,7 @@ parse_task_args() {
           shift
         done
         [[ ${#repos[@]} -gt 0 ]] || die "specify at least one repo after -r"
+        expand_repo_groups
         ;;
       *)
         die "unexpected argument '$1'"
@@ -7122,6 +7221,7 @@ run_init() {
     echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
     echo '# IWORK_REPOS_TMUX_SESSION=repos'
     echo '# IWORK_UPDATE_COMMAND=        # how "iwork update" upgrades Claude Code'
+    echo '# IWORK_REPO_GROUP_MYGROUP=   # "repo-one repo-two", used as -r @mygroup'
     echo '# IWORK_AGENT=claude          # the CLI a new task starts'
     echo '# IWORK_AGENT_ARGS_CLAUDE=     # params handed to it every time'
     echo '# IWORK_AGENT_ARGS_CODEX='
@@ -7604,6 +7704,12 @@ case "${1:-}" in
   --complete-repos)
     require_config
     list_repos "${2:-}"
+    # Groups complete alongside repos, since '-r' takes either and a group you
+    # cannot remember the name of is a group you will not use.
+    while IFS= read -r complete_group; do
+      [[ -n "$complete_group" ]] || continue
+      [[ "@$complete_group" == "${2:-}"* ]] && printf '@%s\n' "$complete_group"
+    done < <(list_repo_groups)
     exit 0
     ;;
   --complete-worktree-folders)
@@ -7924,6 +8030,27 @@ if [[ "${1:-}" == "add-repo" ]]; then
     die "-p does not apply to add-repo; attach the task with 'iwork project add <project> [<task>]'"
 
   warn_message_undelivered "add-repo does not start an agent"
+
+  # A repo the task already has is said and skipped rather than being fatal.
+  # Before repo groups that was a rare typo; '-r @claims' on a task that has one
+  # of the group makes it the ordinary case, and dying on it would mean the
+  # shorthand fails the second time you use it.
+  add_repo_keep=()
+  for add_repo_name in "${repos[@]+${repos[@]}}"; do
+    if [[ -e "$TASKS_DIR/$folder_name/$add_repo_name" ]]; then
+      echo "  $add_repo_name: already in this task, left alone"
+      continue
+    fi
+    add_repo_keep+=("$add_repo_name")
+  done
+
+  if (( ${#add_repo_keep[@]} == 0 )); then
+    echo ""
+    echo "Nothing to add; every repo named is already in '$folder_name'."
+    exit 0
+  fi
+
+  repos=("${add_repo_keep[@]}")
 
   # Normally the branch is read off the worktrees already there. A task whose
   # repos have drifted onto different branches has no single answer, so -b is
