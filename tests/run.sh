@@ -4655,6 +4655,43 @@ test_repos_session_name_may_not_shadow_a_task_session() {
   assert_eq "no session made" "" "$(windows_of_session tasks-repos)"
 }
 
+test_spawn_waits_for_the_shell_before_typing() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  command -v python3 >/dev/null 2>&1 || { printf '    skip (no python3 to flush the tty)\n'; return 0; }
+  mk_repo backend
+
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+printf '%s\\n' "\$*" >> "$SB/claude-argv"
+exit 0
+STUB
+  chmod +x "$SB/bin/claude"
+
+  # Starts the way a heavy zsh does: busy for a moment, then it throws away
+  # whatever was typed in the meantime, and only then shows a prompt.
+  cat > "$SB/bin/slowsh" <<'SH'
+#!/bin/sh
+sleep 1
+python3 -c 'import sys, termios; termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)'
+PS1='$ ' exec /bin/sh -i
+SH
+  chmod +x "$SB/bin/slowsh"
+  # An empty server exits at once and forgets the option, so keep it up.
+  tmux_t start-server \; set -s exit-empty off \; set -g default-shell "$SB/bin/slowsh" >/dev/null 2>&1
+  [[ "$(tmux_t show -gv default-shell 2>/dev/null)" == "$SB/bin/slowsh" ]] ||
+    { printf '    skip (could not set the default shell)\n'; return 0; }
+
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  local waited=0
+  while (( waited < 80 )) && [[ ! -s "$SB/claude-argv" ]]; do
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  assert_eq "the agent starts although the shell ate early keys" "yes" \
+    "$([[ -s "$SB/claude-argv" ]] && echo yes || echo no)"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"

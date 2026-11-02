@@ -5445,6 +5445,25 @@ project_grep() {
 #
 # Finding an existing window is the caller's job, not this function's: a task can
 # be in either of two sessions while a master is only ever in one.
+# A new pane's shell is still starting when tmux hands back its id, and keys
+# sent before it reaches its prompt can be lost: a zsh whose startup queries the
+# terminal or flushes pending input eats the typeahead, often just its first
+# byte, so 'claude' arrives as 'laude' (seen on 3 of 3 detached spawns on
+# 2026-10-22). Wait until the pane has drawn something -- the prompt -- and give
+# up after a few seconds, sending anyway, so a silent prompt costs a delay
+# rather than the agent.
+wait_for_pane_prompt() {
+  local pane="$1"
+  local waited=0
+
+  while (( waited < 50 )); do
+    [[ -z "$(tmux capture-pane -p -t "$pane" 2>/dev/null | tr -d '[:space:]')" ]] || return 0
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
 spawn_agent_window() {
   local first=""
 
@@ -5496,6 +5515,7 @@ spawn_agent_window() {
   tmux select-pane -t "$pane_id" 2>/dev/null || true
 
   printf -v tool_cmd '%q ' "$tool" "$@"
+  wait_for_pane_prompt "$pane_id"
   tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$name'"
 
   printf '%s\n' "$window_id"
@@ -5701,6 +5721,7 @@ open_task_session() {
     tmux select-pane -t "$pane_id" 2>/dev/null || true
 
     printf -v tool_cmd '%q ' "$tool" "$@"
+    wait_for_pane_prompt "$pane_id"
     tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$folder'"
   fi
 
