@@ -155,6 +155,10 @@ iw() {
   [[ -n "${WANT_PROJECT_ENV:-}" ]] && env_args+=(IWORK_PROJECT="$WANT_PROJECT_ENV")
   [[ -n "${WANT_SESSION_MARKERS:-}" ]] && env_args+=(IWORK_SESSION_MARKERS="$WANT_SESSION_MARKERS")
   [[ -n "${WANT_UPDATE_CLAUDE+x}" ]] && env_args+=(IWORK_UPDATE_CLAUDE="$WANT_UPDATE_CLAUDE")
+  [[ -n "${WANT_GROUP_STACK:-}" ]] && env_args+=(IWORK_REPO_GROUP_STACK="$WANT_GROUP_STACK")
+  [[ -n "${WANT_GROUP_RENT_STACK:-}" ]] && env_args+=(IWORK_REPO_GROUP_RENT_STACK="$WANT_GROUP_RENT_STACK")
+  [[ -n "${WANT_AGENT:-}" ]] && env_args+=(IWORK_AGENT="$WANT_AGENT")
+  [[ -n "${WANT_AGENT_ARGS_CODEX:-}" ]] && env_args+=(IWORK_AGENT_ARGS_CODEX="$WANT_AGENT_ARGS_CODEX")
   [[ -n "${WANT_MASTER_RC:-}" ]] && env_args+=(IWORK_MASTER_REMOTE_CONTROL="$WANT_MASTER_RC")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
@@ -3174,6 +3178,83 @@ test_update_keeps_remote_control_on_a_master() {
   assert_contains "and the task without" "feat-one: would restart with 'claude --continue'" "$out"
 }
 
+test_master_remote_control_off_means_off() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=off iw master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv '' || true
+  case "$(cat "$SB/claude-argv" 2>/dev/null)" in
+    *remote-control*) bad "IWORK_MASTER_REMOTE_CONTROL=off still gave the master Remote Control" ;;
+    *) ok ;;
+  esac
+}
+
+# 'iwork master' refuses such a name, but resurrect and update-agents walk every
+# directory under the projects dir, hand-made ones included. The resume line is
+# typed into a shell, so the name has to arrive as one argument, quotes and all.
+test_resurrect_quotes_a_master_name_with_spaces_and_quotes() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local project="it's \"my\" proj"
+  local session="projects-it's \"my\" proj"
+  recording_claude
+  mkdir -p "$SB_PROJECTS/$project"
+  # A plain sh in a clean environment: the operator's shell startup would put
+  # a real claude back ahead of the recording stub.
+  tmux_t new-session -d -s "$session" -n "$project" -c "$SB_PROJECTS/$project" \
+    env -i HOME="$SB_HOME" PATH="$SB/bin:/usr/bin:/bin" /bin/sh 2>/dev/null ||
+    { printf '    skip (tmux would not make the session)\n'; return 0; }
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on iw resurrect --fresh 2>&1)"
+  wait_for_claude_argv 'remote-control' || true
+  assert_eq "the name arrives as one argument, quotes intact" \
+    "--remote-control it's \"my\" proj (master)" "$(cat "$SB/claude-argv" 2>/dev/null)"
+  assert_contains "and resurrect says what it ran" "master of '$project': restarted with" "$out"
+}
+
+test_master_refuses_a_project_name_with_spaces() {
+  recording_claude
+  mkdir -p "$SB_PROJECTS/my proj"
+  local out
+  out="$(WANT_MASTER_RC=on iw master 'my proj' 2>&1 || true)"
+  assert_contains "refused before anything starts" "unsupported characters" "$out"
+  assert_eq "and no claude ran" "" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
+test_config_checks_master_remote_control() {
+  local out
+  out="$(iw config set master-remote-control maybe 2>&1 || true)"
+  assert_contains "a value that is neither on nor off is refused" "is on or off" "$out"
+  iw config set master-remote-control on >/dev/null 2>&1
+  assert_eq "on is accepted and read back" "on" "$(iw config get master-remote-control 2>&1)"
+}
+
+test_resurrect_leaves_remote_control_off_for_an_unsafe_name() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local project="=ls"
+  mkdir -p "$SB_PROJECTS/$project"
+  tmux_t new-session -d -s "projects-$project" -n "$project" -c "$SB_PROJECTS/$project" \
+    env -i HOME="$SB_HOME" PATH="$SB/bin:/usr/bin:/bin" /bin/sh 2>/dev/null ||
+    { printf '    skip (tmux would not make the session)\n'; return 0; }
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=On iw resurrect -n 2>&1)"
+  assert_contains "the master still comes back, without the flag" \
+    "master of '$project': would run 'claude --continue'" "$out"
+  assert_contains "and says why" "not safe to type into a shell" "$out"
+}
+
+test_master_remote_control_value_is_not_case_sensitive() {
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_MASTER_RC=ON iw master myproj >/dev/null 2>&1
+  assert_contains "ON is on" "--remote-control myproj (master)" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
 test_resurrect_gathers_a_projects_task_back_into_its_session() {
   command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
   mk_repo backend
@@ -3207,6 +3288,231 @@ test_resurrect_is_refused_without_tmux() {
 test_resurrect_rejects_an_unknown_argument() {
   assert_fails "a stray argument is refused" iw resurrect feat-one
   assert_contains "with the usage line" "iwork resurrect" "$(iw resurrect feat-one 2>&1)"
+}
+
+# --- the config command -------------------------------------------------------
+
+# The config file is plain shell and always has been, which is fine until you
+# want to change one thing: you open it, hope you remember the setting's name,
+# and find out whether you got it right the next time something breaks.
+
+test_config_lists_what_you_are_actually_getting() {
+  local out
+  out="$(iw config 2>&1)"
+
+  assert_contains "it names the file" "$SB/config" "$out"
+  assert_contains "a setting from the file is marked as such" "config" "$out"
+  # TASKS_DIR is derived from REPO_DIR when unset, so printing the raw variable
+  # would report it as unset -- the opposite of what this is for.
+  assert_contains "a derived setting shows its effective value" "$SB_TASKS" "$out"
+}
+
+test_config_get_takes_any_spelling_of_the_name() {
+  assert_eq "the full name" "claude" "$(iw config get IWORK_AGENT)"
+  assert_eq "without the prefix" "claude" "$(iw config get agent)"
+  assert_eq "and in any case" "claude" "$(iw config get AGENT)"
+}
+
+test_config_get_refuses_a_setting_that_does_not_exist() {
+  assert_fails "an unknown setting is refused" iw config get nonsense
+  assert_contains "and the real ones are listed" "AGENT" \
+    "$(iw config get nonsense 2>&1)"
+}
+
+test_config_set_writes_the_file_and_keeps_the_rest_of_it() {
+  printf '# a comment of my own\n' >> "$SB/config"
+
+  iw config set agent codex >/dev/null 2>&1
+
+  assert_grep "the setting is written" 'IWORK_AGENT="codex"' "$SB/config"
+  assert_grep "and what was already there stays" 'a comment of my own' "$SB/config"
+  assert_eq "and reading it back agrees" "codex" "$(iw config get agent)"
+}
+
+test_config_set_replaces_a_commented_example_in_place() {
+  printf '# IWORK_SHOW_LOG_LINES=12      # how many entries project show prints\n' >> "$SB/config"
+
+  iw config set show-log-lines 20 >/dev/null 2>&1
+
+  assert_grep "the example became the setting" '^IWORK_SHOW_LOG_LINES="20"' "$SB/config"
+  # The sentence next to a commented example is usually the only documentation
+  # of what the setting does.
+  assert_grep "and kept the sentence beside it" 'how many entries' "$SB/config"
+  assert_eq "it is not written twice" "1" \
+    "$(grep -c 'IWORK_SHOW_LOG_LINES' "$SB/config" | tr -d ' ')"
+}
+
+test_config_set_checks_the_value() {
+  assert_fails "an agent iwork does not know is refused" iw config set agent emacs
+  assert_contains "and says what it knows" "knows claude and codex" \
+    "$(iw config set agent emacs 2>&1)"
+
+  assert_fails "a non-numeric line count is refused" iw config set show-log-lines lots
+  assert_contains "and says what it wants" "positive integer" \
+    "$(iw config set show-log-lines lots 2>&1)"
+
+  # Checking here is the point: the alternative is finding out it was wrong the
+  # next time the setting is used.
+  assert_no_grep "nothing was written" "emacs" "$SB/config"
+}
+
+test_config_unset_removes_it() {
+  iw config set agent codex >/dev/null 2>&1
+  assert_grep "it is there first" 'IWORK_AGENT="codex"' "$SB/config"
+
+  iw config unset agent >/dev/null 2>&1
+  assert_no_grep "and gone after" 'IWORK_AGENT="codex"' "$SB/config"
+  assert_fails "unsetting it twice says so" iw config unset agent
+}
+
+test_config_warns_when_the_environment_wins() {
+  # Writing a setting the environment overrides looks like it worked and then
+  # does nothing, which is the worst way to find out.
+  assert_contains "it says the environment wins" "wins over the file" \
+    "$(WANT_AGENT=codex iw config set agent claude 2>&1)"
+}
+
+test_config_group_set_and_rm() {
+  mk_repo backend
+  mk_repo frontend
+
+  iw config group set claims backend frontend >/dev/null 2>&1
+  assert_grep "the group is written" 'IWORK_REPO_GROUP_CLAIMS="backend frontend"' "$SB/config"
+
+  assert_contains "and listed back" "@claims" "$(iw config group 2>&1)"
+  assert_contains "with its repos" "backend frontend" "$(iw config group 2>&1)"
+
+  iw config group rm claims >/dev/null 2>&1
+  assert_no_grep "and removed" 'IWORK_REPO_GROUP_CLAIMS' "$SB/config"
+  assert_fails "removing it twice says so" iw config group rm claims
+}
+
+test_config_group_set_warns_about_a_repo_that_is_not_there() {
+  mk_repo backend
+
+  # Still written: naming a repo you are about to clone is reasonable, so this
+  # is a warning rather than a refusal.
+  local out
+  out="$(iw config group set claims backend nope 2>&1)"
+  assert_contains "the unknown repo is named" "'nope' is not a repo" "$out"
+  assert_grep "and the group is still written" 'IWORK_REPO_GROUP_CLAIMS' "$SB/config"
+}
+
+test_config_path_prints_the_file() {
+  assert_eq "it prints the config path" "$SB/config" "$(iw config path)"
+}
+
+test_config_rejects_a_subcommand_it_does_not_have() {
+  assert_fails "an unknown subcommand is refused" iw config frobnicate
+  assert_contains "with the usage" "iwork config" "$(iw config frobnicate 2>&1)"
+}
+
+# --- repo groups --------------------------------------------------------------
+
+# A combination you keep typing gets a name. The '@' is what keeps it
+# unambiguous: a group and a repo are allowed to share a name.
+
+test_a_group_stands_for_its_repos() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+
+  WANT_GROUP_STACK="backend frontend" iw feat/one -r @stack >/dev/null 2>&1
+
+  assert_dir "the first member is there" "$SB_TASKS/feat-one/backend"
+  assert_dir "and the second" "$SB_TASKS/feat-one/frontend"
+  assert_no_file "and nothing else" "$SB_TASKS/feat-one/shared"
+}
+
+test_a_group_combines_with_plain_repos_without_repeating() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+
+  # '-r @stack backend shared' is the group plus what it did not already
+  # include, not a list with backend in it twice.
+  WANT_GROUP_STACK="backend frontend" \
+    iw feat/one -r @stack backend shared >/dev/null 2>&1
+
+  assert_dir "the group came in" "$SB_TASKS/feat-one/backend"
+  assert_dir "with the rest of it" "$SB_TASKS/feat-one/frontend"
+  assert_dir "and the extra repo" "$SB_TASKS/feat-one/shared"
+}
+
+test_an_unknown_group_says_how_to_define_it() {
+  mk_repo backend
+
+  local out
+  out="$(WANT_GROUP_STACK="backend" iw feat/one -r @nope 2>&1)"
+  assert_contains "it names the group" "no repo group 'nope'" "$out"
+  assert_contains "and the variable to set" 'IWORK_REPO_GROUP_NOPE=' "$out"
+  # The one thing you want when you have mistyped a name is the list of real
+  # ones.
+  assert_contains "and the groups that do exist" "stack" "$out"
+  assert_no_file "nothing was created" "$SB_TASKS/feat-one"
+}
+
+test_a_bare_at_sign_is_refused() {
+  mk_repo backend
+  assert_fails "'@' alone is refused" iw feat/one -r @
+  assert_contains "and says what it wants" "needs a group name" \
+    "$(iw feat/one -r @ 2>&1)"
+}
+
+test_a_group_name_may_have_a_dash() {
+  mk_repo backend
+  mk_repo frontend
+
+  # '@rent-stack' reads from IWORK_REPO_GROUP_RENT_STACK: the same name mapping
+  # the per-agent settings use.
+  WANT_GROUP_RENT_STACK="backend frontend" iw feat/one -r @rent-stack >/dev/null 2>&1
+  assert_dir "the dashed name resolved" "$SB_TASKS/feat-one/backend"
+  assert_dir "to both repos" "$SB_TASKS/feat-one/frontend"
+}
+
+test_add_repo_takes_a_group() {
+  mk_repo backend
+  mk_repo frontend
+  mk_repo shared
+  iw feat/one -r shared >/dev/null 2>&1
+
+  WANT_GROUP_STACK="backend frontend" iw add-repo feat-one -r @stack >/dev/null 2>&1
+  assert_dir "the group was added" "$SB_TASKS/feat-one/backend"
+  assert_dir "all of it" "$SB_TASKS/feat-one/frontend"
+  assert_dir "beside what was there" "$SB_TASKS/feat-one/shared"
+}
+
+test_add_repo_skips_what_the_task_already_has() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # Groups make partial overlap the ordinary case: '-r @stack' on a task that
+  # already has one member used to fail outright, so the shorthand broke the
+  # second time you used it.
+  local out
+  out="$(WANT_GROUP_STACK="backend frontend" iw add-repo feat-one -r @stack 2>&1)"
+  assert_contains "the one already there is named" "backend: already in this task" "$out"
+  assert_dir "and the missing one is added" "$SB_TASKS/feat-one/frontend"
+}
+
+test_add_repo_of_only_repos_already_present_does_nothing() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  local out
+  out="$(iw add-repo feat-one -r backend 2>&1)"
+  assert_contains "it says there is nothing to do" "Nothing to add" "$out"
+  assert_dir "and the task is unchanged" "$SB_TASKS/feat-one/backend"
+}
+
+test_groups_complete_alongside_repos() {
+  mk_repo backend
+
+  local out
+  out="$(WANT_GROUP_STACK="backend" iw --complete-repos 2>&1)"
+  assert_contains "a real repo is offered" "backend" "$out"
+  assert_contains "and the group, with its sigil" "@stack" "$out"
 }
 
 # --- rm from inside the thing being killed ------------------------------------
@@ -3339,6 +3645,51 @@ test_rm_from_another_window_still_kills_immediately() {
     *) ok ;;
   esac
   assert_no_file "and the task folder is gone" "$SB_TASKS/feat-one"
+}
+
+# --- a task whose repos disagree ---------------------------------------------
+
+# remove_worktrees reads the task's branch so it can record it in the project
+# history. That read dies when the repos are on different branches -- and the
+# die used to take the whole process with it, because 'die' calls exit, which
+# terminates a command substitution's subshell rather than returning a status
+# that the '|| true' inside it could catch.
+
+test_rm_works_on_a_task_whose_repos_disagree() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend -p myproj >/dev/null 2>&1
+  git -C "$SB_TASKS/feat-one/frontend" checkout -q -b feat/went-its-own-way
+
+  # It printed its plan, asked, and exited having removed nothing and said
+  # nothing -- 2>/dev/null had eaten the one sentence that explained it.
+  assert_ok "rm removes it anyway" iw rm -f feat-one
+  assert_no_file "and the task is gone" "$SB_TASKS/feat-one"
+  assert_dir "while the project it was in survives" "$SB_PROJECTS/myproj"
+}
+
+test_project_delete_cascade_survives_a_mixed_branch_task() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend -p myproj >/dev/null 2>&1
+  git -C "$SB_TASKS/feat-one/frontend" checkout -q -b feat/went-its-own-way
+
+  # The same read, reached through the cascade: this is how it was found.
+  assert_ok "the cascade completes" iw project delete -rf myproj
+  assert_no_file "the task is gone" "$SB_TASKS/feat-one"
+  assert_no_file "and so is the project" "$SB_PROJECTS/myproj"
+}
+
+test_a_mixed_branch_task_is_still_removable_without_a_project() {
+  mk_repo backend
+  mk_repo frontend
+  iw feat/one -r backend frontend >/dev/null 2>&1
+  git -C "$SB_TASKS/feat-one/frontend" checkout -q -b feat/went-its-own-way
+
+  # Unattached tasks never reached the branch read at all, which is why this
+  # went unnoticed: it only bit tasks that belonged to a project.
+  assert_ok "rm removes it" iw rm -f feat-one
+  assert_no_file "and the task is gone" "$SB_TASKS/feat-one"
 }
 
 # --- files nobody claimed ----------------------------------------------------
@@ -4039,6 +4390,105 @@ test_rm_still_refuses_from_the_project_directory() {
     "$(iw_in "$SB_PROJECTS/myproj" rm -f feat-one 2>&1)"
 }
 
+# --- which CLI a task runs ---------------------------------------------------
+
+# iwork ran claude and only claude. 'iwork codex <task>' could open a task that
+# already existed, but nothing could create one, so a codex task was a thing you
+# could not get to.
+
+test_a_task_starts_the_configured_agent() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+
+  # The stubs exit at once, so what was asked for is read off the pane's
+  # scrollback rather than off a live process.
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  WANT_AGENT=codex WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "the task came up on codex" "CODEX RAN" \
+    "$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+}
+
+test_the_agent_flag_beats_the_config() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  WANT_TMUX=1 iw --agent codex --detach feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "the flag picked the agent" "CODEX RAN" \
+    "$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+}
+
+test_an_unknown_agent_is_refused() {
+  mk_repo backend
+  assert_fails "an agent iwork does not know is refused" \
+    iw --agent emacs feat/one -r backend
+  assert_contains "and says what it knows" "knows claude and codex" \
+    "$(iw --agent emacs feat/one -r backend 2>&1)"
+  assert_no_file "and nothing was created" "$SB_TASKS/feat-one"
+}
+
+test_per_agent_params_are_passed_on() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  WANT_AGENT=codex WANT_AGENT_ARGS_CODEX="--full-auto" WANT_TMUX=1 \
+    iw --detach feat/one -r backend >/dev/null 2>&1
+
+  assert_contains "the configured params went with it" "CODEX RAN: --full-auto" \
+    "$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+}
+
+test_a_first_prompt_is_shaped_for_the_agent() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  printf '#!/bin/sh\necho "CODEX RAN: $*"\n' > "$SB/bin/codex"
+  chmod +x "$SB/bin/codex"
+
+  # claude reads a first prompt after a '--'; codex takes it as its argument.
+  # Handing codex claude's shape would have it look for a file called '--'.
+  WANT_AGENT=codex WANT_TMUX=1 \
+    iw -m "look at the thing" --detach feat/one -r backend >/dev/null 2>&1
+
+  local out
+  out="$(pane_text_eventually '=tasks:feat-one' 'CODEX RAN')"
+  assert_contains "the prompt reached codex" "look at the thing" "$out"
+  case "$out" in
+    *"CODEX RAN: --"*) bad "codex was handed claude's '--' shape" ;;
+    *) ok ;;
+  esac
+}
+
+test_a_task_can_be_named_the_way_its_branch_was() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # The folder is the branch with the slashes flattened, a mapping iwork
+  # invented and then refused to read back: every command afterwards insisted on
+  # 'feat-one' and rejected the name the task was created with.
+  assert_ok "the branch spelling resolves" iw --resolve-worktree-folder feat/one
+  assert_contains "to the folder it made" "/feat-one" \
+    "$(iw --resolve-worktree-folder feat/one 2>&1)"
+  assert_contains "and the flat spelling still works" "/feat-one" \
+    "$(iw --resolve-worktree-folder feat-one 2>&1)"
+}
+
+test_a_name_with_a_slash_says_what_the_folder_would_be() {
+  mk_repo backend
+  iw feat/one -r backend >/dev/null 2>&1
+
+  # Nothing by that name exists either way, but the message now says what the
+  # folder for it would be called instead of only that a slash is wrong.
+  assert_contains "it names the flattened spelling" "'review-vignirs-prs'" \
+    "$(iw --no-tmux rm -f review/vignirs/prs 2>&1; iw --resolve-worktree-folder review/vignirs-prs 2>&1)"
+}
+
 # --- update ------------------------------------------------------------------
 
 # The suite's default claude stub exits at once, which is the shape of a *dead*
@@ -4074,6 +4524,27 @@ bump_version_command() {
 # send-keys returns before the agent has started, and update-agents works out
 # which agent a pane runs from the process in front of it -- so a test that does
 # not wait finds no agents at all.
+# send-keys returns before the shell has run anything, so a pane read straight
+# afterwards is empty. Poll for the text instead.
+pane_text_eventually() {
+  local target="$1" needle="$2" pane="" waited=0 out=""
+
+  pane="$(tmux_t list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | head -1)"
+  [[ -n "$pane" ]] || return 1
+
+  while (( waited < 60 )); do
+    out="$(tmux_t capture-pane -p -t "$pane" 2>/dev/null)"
+    case "$out" in
+      *"$needle"*) printf '%s' "$out"; return 0 ;;
+    esac
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  printf '%s' "$out"
+  return 1
+}
+
 wait_for_agent() {
   local pane=""
   pane="$(tmux_t list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | head -1)"

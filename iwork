@@ -3,7 +3,11 @@ set -euo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[0]:-$0}")"
 IWORK_CONFIG_FILE="${IWORK_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/iwork/config}"
-IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX IWORK_MASTER_REMOTE_CONTROL)
+IWORK_CONFIG_VARS=(IWORK_REPO_DIR IWORK_TASKS_DIR IWORK_PROJECTS_DIR IWORK_TMUX_SESSION IWORK_PROJECTS_TMUX_SESSION IWORK_REPOS_TMUX_SESSION IWORK_CONTEXT_TEMPLATE IWORK_PROJECT_TEMPLATE IWORK_EDITOR IWORK_NO_TMUX IWORK_NO_CONTEXT IWORK_DETACH IWORK_BIG IWORK_ASSUME_YES IWORK_PROJECT IWORK_SHOW_LOG_LINES IWORK_SESSION_MARKERS IWORK_UPDATE_CLAUDE IWORK_UPDATE_CODEX IWORK_RESUME_CLAUDE IWORK_RESUME_CODEX IWORK_AGENT IWORK_AGENT_ARGS_CLAUDE IWORK_AGENT_ARGS_CODEX IWORK_MASTER_REMOTE_CONTROL)
+
+# Names that arrived from the environment rather than the config file, filled
+# in by load_config and read only by 'iwork config'.
+IWORK_FROM_ENV=""
 
 load_config() {
   local var="" restore=""
@@ -11,10 +15,14 @@ load_config() {
   [[ -f "$IWORK_CONFIG_FILE" ]] || return 0
 
   # Environment variables win over the config file: remember what came from
-  # the environment, source the config, then put those values back.
+  # the environment, source the config, then put those values back. The names
+  # are kept as well, so 'iwork config' can say which of these you are actually
+  # getting and from where, rather than printing a value and leaving you to
+  # work out why the file disagrees with it.
   for var in "${IWORK_CONFIG_VARS[@]}"; do
     if [[ -n "${!var+x}" ]]; then
       restore="$restore $var=$(printf '%q' "${!var}");"
+      IWORK_FROM_ENV="$IWORK_FROM_ENV $var"
     fi
   done
 
@@ -51,6 +59,12 @@ IWORK_UPDATE_CLAUDE="${IWORK_UPDATE_CLAUDE:-}"
 IWORK_UPDATE_CODEX="${IWORK_UPDATE_CODEX:-}"
 IWORK_RESUME_CLAUDE="${IWORK_RESUME_CLAUDE:-}"
 IWORK_RESUME_CODEX="${IWORK_RESUME_CODEX:-}"
+# Which CLI a new task starts, and anything to hand it every time. iwork ran
+# claude and only claude: 'iwork codex <task>' could open an existing task with
+# codex, but nothing could ever create one, so a codex task was unreachable.
+IWORK_AGENT="${IWORK_AGENT:-claude}"
+IWORK_AGENT_ARGS_CLAUDE="${IWORK_AGENT_ARGS_CLAUDE:-}"
+IWORK_AGENT_ARGS_CODEX="${IWORK_AGENT_ARGS_CODEX:-}"
 # 'on' starts every claude master with Remote Control, so a project can be
 # steered from the Claude apps as well as from tmux (see master_remote_control_name).
 IWORK_MASTER_REMOTE_CONTROL="${IWORK_MASTER_REMOTE_CONTROL:-off}"
@@ -90,10 +104,10 @@ require_config() {
 
 usage() {
   cat <<'EOF'
-Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
-                                   [-p <project>]
+Usage: iwork [flags] <branch-name> [--from <task|branch>]
+                                   -r <repo|@group> ... [-p <project>]
        iwork add-repo [<task>] [-b <branch>] [--from <task|branch>]
-                      -r <repo1> [repo2 ...]
+                      -r <repo|@group> ...
        iwork [--no-tmux] rm [-f] <task|--current> [-r <repo1> [repo2 ...]]
        iwork [flags] park <task> [-p <project>]
        iwork cull [-n] [--all] [-p <project>] [<task> ...]
@@ -106,6 +120,8 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork update-agents [-n] [-f] [--busy] [--restart]
        iwork resurrect [-n] [--fresh] [--big <task>]...
        iwork repos [-n] [-d]
+       iwork config [list | get <setting> | set <setting> <value>
+                    | unset <setting> | group ... | path | edit]
        iwork init
        iwork install-hooks [settings-path]
        iwork --completion <bash|zsh>
@@ -126,7 +142,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>] -r <repo1> [repo2 ...]
        iwork done <todo-id> [--nth <n>] [-p <project>]
        iwork drop <todo-id> [--nth <n>] [-p <project>]
 
-       flags: [--no-tmux] [--no-context] [--detach|-d] [--big]
+       flags: [--no-tmux] [--no-context] [--detach|-d] [--big] [--agent <cli>]
               [--message|-m <message>]
 
 Create a task folder in the tasks directory and set up git worktrees for
@@ -136,6 +152,23 @@ subdirectory named after the repo it comes from.
 New branches start from the base branch but get no upstream, so status and
 prompts do not report them as ahead of/behind origin/main before they are
 pushed. Use 'git push -u origin HEAD' to set a real upstream.
+
+A repo list takes '@group' as well as repo names. A group is a combination
+you keep typing, given a name in the config:
+
+  IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api contracts-api"
+  IWORK_REPO_GROUP_RENT_STACK="rent-api rent-frontend-v2"
+
+  iwork feat/x -r @claims                  the three of them
+  iwork feat/x -r @claims email-templates  and one more
+  iwork add-repo feat-x -r @rent-stack     into a task that exists
+
+The '@' is what keeps it unambiguous: a group and a repo are allowed to
+share a name, and without the sigil whichever happened to exist would
+decide what you meant. Repeats are dropped, so a group overlapping a repo
+you also named is not an error. 'add-repo' skips a repo the task already
+has and says which, since a group that overlaps is the ordinary case
+rather than a mistake.
 
 --from <task|branch> stacks a task on earlier work instead of starting from
 origin/main. Per repo, iwork uses the first of these that exists, and says
@@ -191,6 +224,20 @@ it and -- if it creates what it cannot find, as tmux-sessionx does --
 build a second session under the stale name. The hook in --tmux-config
 folds such a split back together if you want the marker anyway.
 
+Which CLI a task runs is IWORK_AGENT, 'claude' unless you say otherwise, and
+--agent <cli> overrides it for one invocation. iwork knows claude and codex.
+IWORK_AGENT_ARGS_CLAUDE and IWORK_AGENT_ARGS_CODEX are handed to that CLI on
+every start, so a flag you always want lives in the config rather than in your
+fingers. A project's master is always claude: its brief arrives through the
+Claude SessionStart hook, and nothing else reads it.
+
+'iwork claude <task>' and 'iwork codex <task>' still name the CLI themselves,
+for a task that already exists.
+
+A task argument may be spelled either way: a task folder is its branch with
+the slashes flattened, so 'review/vignirs-prs' and 'review-vignirs-prs' both
+find the same task.
+
 -m <message> hands the agent the message as its first prompt, so a new task
 starts working the moment it comes up instead of waiting for you to type it.
 It applies wherever iwork starts an agent itself: creation, park, and
@@ -234,6 +281,16 @@ knows that work is already in its history: the template can place it with a
 section instead.
 
 Subcommands:
+  config         Read and change the config file without opening it. 'config'
+                 lists every setting with the value you are actually getting
+                 and where it came from -- the file, the environment, or a
+                 default. 'get'/'set'/'unset' take the name in any case and
+                 with or without the IWORK_ prefix, check the value before
+                 writing it, and leave the rest of the file alone, replacing a
+                 commented example in place rather than appending past it.
+                 'config group set <name> <repo>...' names a repo combination
+                 for -r @<name>; 'group' lists them, 'group rm' removes one.
+                 'path' prints the file, 'edit' opens it in $EDITOR
   init           Interactively create the config file
   add-repo       Add one or more repos to an existing task folder
   skills         Relink .claude/skills for every task, or just the named one;
@@ -559,9 +616,46 @@ reject_trailing_message_flag() {
   done
 }
 
+validate_agent_name() {
+  local agent="$1"
+
+  case "$agent" in
+    claude|codex) ;;
+    *)
+      die "unknown agent '$agent'; iwork knows claude and codex.
+  Set IWORK_AGENT in $IWORK_CONFIG_FILE to pick the default."
+      ;;
+  esac
+}
+
+# Anything to hand this CLI on every start, from the config. Word-split on
+# purpose: it is a command line, written as one.
+agent_start_args() {
+  local agent="$1"
+  local var=""
+
+  var="IWORK_AGENT_ARGS_$(agent_config_suffix "$agent")"
+  printf '%s' "${!var:-}"
+}
+
+# How each CLI takes a first prompt, which is not the same shape twice: claude
+# reads it after a '--', codex takes it as its argument. Knowing this is iwork's
+# job rather than the operator's, so it is not config.
 agent_message_args() {
+  local agent="${1:-$IWORK_AGENT}"
+  local extra=""
+
   AGENT_ARGS=()
-  [[ -z "$INITIAL_MESSAGE" ]] || AGENT_ARGS=(-- "$INITIAL_MESSAGE")
+
+  extra="$(agent_start_args "$agent")"
+  [[ -z "$extra" ]] || AGENT_ARGS=($extra)
+
+  [[ -n "$INITIAL_MESSAGE" ]] || return 0
+
+  case "$agent" in
+    codex) AGENT_ARGS+=("$INITIAL_MESSAGE") ;;
+    *) AGENT_ARGS+=(-- "$INITIAL_MESSAGE") ;;
+  esac
 }
 
 # -m only reaches an agent that this invocation starts itself. Everywhere else
@@ -602,12 +696,29 @@ validate_repo_name() {
   fi
 }
 
+# A task's folder is its branch with the slashes flattened, which is a mapping
+# iwork invented and then only applied in one direction: 'iwork feat/x -r repo'
+# made 'feat-x', and every command afterwards insisted on 'feat-x'. Typing the
+# name you created it with got you "must be a direct child", which is true and
+# explains nothing. The mapping is iwork's own and deterministic, so it is
+# applied here too.
+task_name_from_arg() {
+  local given="$1"
+
+  case "$given" in
+    */*) printf '%s\n' "${given//\//-}" ;;
+    *) printf '%s\n' "$given" ;;
+  esac
+}
+
 validate_worktree_folder_name() {
   local folder="$1"
 
   case "$folder" in
     ""|.|..|*/*|*\\* )
-      die "folder '$folder' must be a direct child of $TASKS_DIR"
+      die "folder '$folder' must be a direct child of $TASKS_DIR.
+  A task folder is its branch with the slashes flattened, so this one would be
+  '$(printf '%s' "$folder" | tr / -)'."
       ;;
     \**|!* )
       die "folder '$folder' must not start with '*' or '!'"
@@ -725,6 +836,7 @@ resolve_worktree_folder() {
   local folder="$1"
   local folder_path=""
 
+  folder="$(task_name_from_arg "$folder")"
   validate_worktree_folder_name "$folder"
 
   folder_path="$TASKS_DIR/$folder"
@@ -905,8 +1017,8 @@ park_current_repo() {
     attach_task_to_project "$folder_name" "$project" "$branch"
   fi
 
-  agent_message_args
-  open_task "$folder_name" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  agent_message_args "$IWORK_AGENT"
+  open_task "$folder_name" "$IWORK_AGENT" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 }
 
 detect_branch_from_worktree_folder() {
@@ -1255,7 +1367,16 @@ remove_worktrees() {
   # the branch and repo list can still be recovered.
   project="$(task_project_name "$folder" || true)"
   if [[ -n "$project" ]] && project_exists "$project"; then
-    project_branch="$(detect_branch_from_worktree_folder "$folder" 2>/dev/null || true)"
+    # The '|| true' belongs on the assignment, not inside the substitution.
+    # detect_branch_from_worktree_folder reaches 'die' when a task's repos are on
+    # different branches, and 'die' calls exit -- which *terminates* the
+    # substitution's subshell rather than returning a status, so a '|| true' in
+    # there never runs. The failure then landed on the assignment, 'set -e' took
+    # the whole process, and 2>/dev/null had already eaten the one sentence that
+    # would have explained it: 'rm' on a mixed-branch task printed its plan,
+    # asked, and exited without removing anything or saying why.
+    project_branch="$(detect_branch_from_worktree_folder "$folder" 2>/dev/null)" ||
+      project_branch=""
     project_repos="$(task_repos_csv "$folder")"
   else
     project=""
@@ -1444,6 +1565,85 @@ remove_worktrees() {
   run_deferred_kill
 }
 
+# A repo group is a name for a combination you keep typing: '-r @claims' stands
+# for the repos IWORK_REPO_GROUP_CLAIMS names. The '@' is what keeps it
+# unambiguous -- a group and a repo are allowed to share a name, and without the
+# sigil whichever happened to exist would decide what you meant.
+#
+# One variable per group rather than one list of all of them: it reads as config
+# rather than as a format, and it is the same shape as IWORK_AGENT_ARGS_<CLI>.
+# They cannot be in IWORK_CONFIG_VARS, since the names are yours, so a group set
+# in the environment does not beat one in the config file the way other settings
+# do.
+repo_group_var() {
+  printf 'IWORK_REPO_GROUP_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+}
+
+repo_group_members() {
+  local var=""
+
+  var="$(repo_group_var "$1")"
+  printf '%s' "${!var:-}"
+}
+
+list_repo_groups() {
+  local var=""
+
+  while IFS= read -r var; do
+    [[ -n "$var" ]] || continue
+    [[ -n "${!var:-}" ]] || continue
+    printf '%s\n' "$(printf '%s' "${var#IWORK_REPO_GROUP_}" | tr '[:upper:]_' '[:lower:]-')"
+  done < <(compgen -v 2>/dev/null | grep '^IWORK_REPO_GROUP_' | sort)
+}
+
+repo_groups_hint() {
+  local known=""
+
+  known="$(list_repo_groups | tr '\n' ' ')"
+  [[ -n "$known" ]] || return 0
+
+  printf '\n  Groups you have defined: %s' "${known% }"
+}
+
+# Rewrites the collected repo list with every '@group' replaced by its members,
+# in the order they were written and without repeats -- so '-r @claims rent-api'
+# is the group plus anything it did not already include, rather than a list with
+# rent-api in it twice.
+expand_repo_groups() {
+  local out=()
+  local seen=$'\n'
+  local item=""
+  local member=""
+  local members=""
+
+  for item in "${repos[@]+${repos[@]}}"; do
+    case "$item" in
+      @)
+        die "'@' needs a group name after it"
+        ;;
+      @*)
+        members="$(repo_group_members "${item#@}")"
+        [[ -n "$members" ]] ||
+          die "no repo group '${item#@}'. Define it in $IWORK_CONFIG_FILE:
+  $(repo_group_var "${item#@}")=\"repo-one repo-two\"$(repo_groups_hint)"
+
+        for member in $members; do
+          [[ "$seen" != *$'\n'"$member"$'\n'* ]] || continue
+          seen="$seen$member"$'\n'
+          out+=("$member")
+        done
+        ;;
+      *)
+        [[ "$seen" != *$'\n'"$item"$'\n'* ]] || continue
+        seen="$seen$item"$'\n'
+        out+=("$item")
+        ;;
+    esac
+  done
+
+  repos=("${out[@]+${out[@]}}")
+}
+
 parse_repos_flag() {
   local missing_flag_message="$1"
   shift
@@ -1468,6 +1668,8 @@ parse_repos_flag() {
   if [[ ${#repos[@]} -eq 0 ]]; then
     die "specify at least one repo after -r"
   fi
+
+  expand_repo_groups
 }
 
 # Consumes one flag from the front of "$@" and reports how many arguments it
@@ -1481,6 +1683,12 @@ take_task_flag() {
     --no-context) IWORK_NO_CONTEXT=1; FLAG_SHIFT=1 ;;
     -d|--detach) IWORK_DETACH=1; FLAG_SHIFT=1 ;;
     --big) IWORK_BIG=1; FLAG_SHIFT=1 ;;
+    --agent)
+      [[ $# -gt 1 ]] || die "--agent needs an agent name"
+      IWORK_AGENT="$2"
+      validate_agent_name "$IWORK_AGENT"
+      FLAG_SHIFT=2
+      ;;
     --from)
       [[ $# -gt 1 ]] || die "--from needs a task or branch name"
       BASE_SPEC="$2"
@@ -1536,6 +1744,7 @@ parse_task_args() {
           shift
         done
         [[ ${#repos[@]} -gt 0 ]] || die "specify at least one repo after -r"
+        expand_repo_groups
         ;;
       *)
         die "unexpected argument '$1'"
@@ -1981,7 +2190,7 @@ _iwork() {
   fi
 
   if [[ -z "$cmd" ]]; then
-    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --from -b --branch --message -m -h --help --completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "add-repo rm park list cd claude codex master resurrect repos skills cull update-agents config project todo log decided done drop init install-hooks --no-tmux --no-context --detach -d --big --agent --from -b --branch --message -m -h --help --completion" -- "$cur") )
     return 0
   fi
 
@@ -2193,6 +2402,7 @@ _iwork() {
       'decided[record a decision in the project log]' \
       'done[close a captured todo by id]' \
       'drop[abandon a captured todo by id]' \
+      'config[read and change the config file]' \
       'init[create the iwork config file]' \
       'install-hooks[install Claude Code status hooks]' \
       '--no-tmux[skip tmux window handling]' \
@@ -2200,6 +2410,7 @@ _iwork() {
       '--detach[create the task window without switching to it]' \
       '-d[create the task window without switching to it]' \
       '--big[give the task its own tmux session with a window per repo]' \
+      '--agent[which CLI the task starts: claude or codex]' \
       '--from[start the new branches from this task or branch]' \
       '-b[branch for the new worktrees (add-repo only)]' \
       '--branch[branch for the new worktrees (add-repo only)]' \
@@ -2350,6 +2561,7 @@ _iwork() {
         '--detach[create the task window without switching to it]' \
         '-d[create the task window without switching to it]' \
         '--big[give the task its own tmux session with a window per repo]' \
+      '--agent[which CLI the task starts: claude or codex]' \
         '--from[start the new branches from this task or branch]' \
         '-b[branch for the new worktrees (add-repo only)]' \
         '--branch[branch for the new worktrees (add-repo only)]' \
@@ -3442,6 +3654,7 @@ resolve_task_arg() {
   local inferred=""
 
   if [[ -n "$given" ]]; then
+    given="$(task_name_from_arg "$given")"
     validate_worktree_folder_name "$given"
     printf '%s\n' "$given"
     return 0
@@ -4166,6 +4379,371 @@ cmd_cull() {
   fi
 
   (( kept == 0 )) || echo "Kept tasks hold work git cannot give back; removing those is 'iwork rm'."
+}
+
+# --- config ------------------------------------------------------------------
+
+# The config file is plain shell and always has been, which is fine until you
+# want to change one thing in it: you open it, hope you remember the name of the
+# setting, and find out whether you got it right the next time something breaks.
+# 'iwork config' is the same file, with the names and the checking built in.
+
+config_key_known() {
+  local key="$1"
+  local known=""
+
+  case "$key" in
+    IWORK_REPO_GROUP_?*) return 0 ;;
+  esac
+
+  for known in "${IWORK_CONFIG_VARS[@]}"; do
+    [[ "$known" != "$key" ]] || return 0
+  done
+
+  return 1
+}
+
+# Accepts the name as written in the file, in any case, and with the IWORK_
+# prefix left off -- 'agent', 'AGENT' and 'IWORK_AGENT' are the same setting,
+# because remembering which of those it was is the thing this command exists to
+# stop you doing.
+config_key_from_arg() {
+  local given="$1"
+  local key=""
+
+  key="$(printf '%s' "$given" | tr '[:lower:]-' '[:upper:]_')"
+  case "$key" in
+    IWORK_*) ;;
+    *) key="IWORK_$key" ;;
+  esac
+
+  config_key_known "$key" || return 1
+  printf '%s\n' "$key"
+}
+
+config_keys_hint() {
+  printf '  Settings: %s\n' "$(printf '%s ' "${IWORK_CONFIG_VARS[@]}" | sed 's/IWORK_//g')"
+  printf '  plus IWORK_REPO_GROUP_<NAME> for a repo group.\n'
+}
+
+# What the file itself says, as opposed to what the value ended up being.
+config_file_value() {
+  local key="$1"
+  local line=""
+
+  [[ -f "$IWORK_CONFIG_FILE" ]] || return 1
+
+  line="$(grep -E "^[[:space:]]*$key=" "$IWORK_CONFIG_FILE" 2>/dev/null | tail -1)" || return 1
+  [[ -n "$line" ]] || return 1
+
+  line="${line#*=}"
+  # Unwrap one layer of quoting, which is how this command writes them.
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+
+  printf '%s\n' "$line"
+}
+
+config_from_env() {
+  case " $IWORK_FROM_ENV " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Rewrites one assignment in place, keeping everything else in the file exactly
+# where it was. A commented example is replaced rather than appended past, so a
+# config written by 'iwork init' stays the shape it was written in instead of
+# growing a second copy of every setting at the bottom.
+config_file_write() {
+  local key="$1"
+  local value="$2"
+  local tmp=""
+  local line=""
+  local done=""
+  local rendered=""
+  local trailer=""
+
+  printf -v rendered '%s="%s"' "$key" "$(config_escape "$value")"
+
+  mkdir -p "$(dirname "$IWORK_CONFIG_FILE")" 2>/dev/null ||
+    die "could not create $(dirname "$IWORK_CONFIG_FILE")"
+  [[ -f "$IWORK_CONFIG_FILE" ]] || : > "$IWORK_CONFIG_FILE"
+
+  tmp="$IWORK_CONFIG_FILE.iwork-tmp.$$"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$done" ]] && [[ "$line" =~ ^[[:space:]]*#?[[:space:]]*$key= ]]; then
+      # A commented example usually carries the sentence that says what the
+      # setting is for. Replacing the line should not cost you that.
+      trailer=""
+      [[ "$line" =~ [[:space:]](#[^\"\']*)$ ]] && trailer="   ${BASH_REMATCH[1]}"
+      printf '%s%s\n' "$rendered" "$trailer"
+      done=1
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$IWORK_CONFIG_FILE" > "$tmp"
+
+  [[ -n "$done" ]] || printf '%s\n' "$rendered" >> "$tmp"
+
+  mv "$tmp" "$IWORK_CONFIG_FILE" || { rm -f "$tmp"; die "could not write $IWORK_CONFIG_FILE"; }
+}
+
+config_file_remove() {
+  local key="$1"
+  local tmp=""
+  local line=""
+  local found=""
+
+  [[ -f "$IWORK_CONFIG_FILE" ]] || return 1
+
+  tmp="$IWORK_CONFIG_FILE.iwork-tmp.$$"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*$key= ]]; then
+      found=1
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$IWORK_CONFIG_FILE" > "$tmp"
+
+  [[ -n "$found" ]] || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$IWORK_CONFIG_FILE" || { rm -f "$tmp"; die "could not write $IWORK_CONFIG_FILE"; }
+}
+
+# The file is sourced, so a value goes in double quotes and anything that would
+# mean something inside them is escaped.
+config_escape() {
+  local value="$1"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '%s' "$value"
+}
+
+# Checking a value here is the point: the alternative is finding out it was
+# wrong the next time the setting is used, which for half of these is a command
+# that then does nothing and does not say why.
+validate_config_value() {
+  local key="$1"
+  local value="$2"
+  local repo=""
+
+  case "$key" in
+    IWORK_AGENT)
+      validate_agent_name "$value"
+      ;;
+    IWORK_REPO_DIR|IWORK_TASKS_DIR|IWORK_PROJECTS_DIR)
+      [[ -d "$value" ]] || warn "$key is not a directory yet: $value"
+      ;;
+    IWORK_SHOW_LOG_LINES)
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$key must be a positive integer, got '$value'"
+      ;;
+    IWORK_SESSION_MARKERS|IWORK_MASTER_REMOTE_CONTROL)
+      case "$value" in
+        on|off|1|0|yes|no|true|false) ;;
+        *) die "$key is on or off, got '$value'" ;;
+      esac
+      ;;
+    IWORK_TMUX_SESSION|IWORK_PROJECTS_TMUX_SESSION|IWORK_REPOS_TMUX_SESSION)
+      case "$value" in
+        ""|*:*|*.*) die "$key may not be empty or contain ':' or '.'" ;;
+      esac
+      ;;
+    IWORK_REPO_GROUP_*)
+      [[ -n "$value" ]] || die "a repo group needs at least one repo"
+      for repo in $value; do
+        validate_repo_name "$repo"
+        [[ -d "$REPO_DIR/$repo" ]] || warn "'$repo' is not a repo in $REPO_DIR"
+      done
+      ;;
+  esac
+}
+
+config_group_name_from_key() {
+  printf '%s' "${1#IWORK_REPO_GROUP_}" | tr '[:upper:]_' '[:lower:]-'
+}
+
+# Several settings are read once into a working variable with a default or a
+# derivation applied -- TASKS_DIR is REPO_DIR/tasks unless you said otherwise.
+# Printing the raw IWORK_ variable would report those as unset, which is the
+# opposite of what this command is for: what you are actually getting.
+config_effective_value() {
+  local key="$1"
+  local runtime=""
+
+  case "$key" in
+    IWORK_REPO_DIR) runtime="REPO_DIR" ;;
+    IWORK_TASKS_DIR) runtime="TASKS_DIR" ;;
+    IWORK_PROJECTS_DIR) runtime="PROJECTS_DIR" ;;
+    IWORK_TMUX_SESSION) runtime="TASKS_SESSION" ;;
+    IWORK_PROJECTS_TMUX_SESSION) runtime="PROJECTS_SESSION" ;;
+    IWORK_REPOS_TMUX_SESSION) runtime="REPOS_SESSION" ;;
+    IWORK_CONTEXT_TEMPLATE) runtime="CONTEXT_TEMPLATE" ;;
+    IWORK_PROJECT_TEMPLATE) runtime="PROJECT_TEMPLATE" ;;
+    IWORK_SHOW_LOG_LINES) runtime="SHOW_LOG_LINES" ;;
+    *) runtime="$key" ;;
+  esac
+
+  printf '%s' "${!runtime:-}"
+}
+
+config_show_all() {
+  local key=""
+  local value=""
+  local source=""
+  local width=0
+
+  for key in "${IWORK_CONFIG_VARS[@]}"; do
+    (( ${#key} <= width )) || width=${#key}
+  done
+
+  echo "$IWORK_CONFIG_FILE"
+  echo ""
+
+  for key in "${IWORK_CONFIG_VARS[@]}"; do
+    value="$(config_effective_value "$key")"
+
+    if config_from_env "$key"; then
+      source="environment"
+    elif config_file_value "$key" >/dev/null 2>&1; then
+      source="config"
+    elif [[ -n "$value" ]]; then
+      source="default"
+    else
+      source=""
+    fi
+
+    printf '%-*s  %-28s %s\n' "$width" "$key" "${value:--}" "$source"
+  done
+
+  config_show_groups
+}
+
+config_show_groups() {
+  local name=""
+  local var=""
+  local any=""
+
+  while IFS= read -r var; do
+    [[ -n "$var" ]] || continue
+    [[ -n "${!var:-}" ]] || continue
+    [[ -n "$any" ]] || { echo ""; echo "Repo groups:"; any=1; }
+    name="$(config_group_name_from_key "$var")"
+    printf '  @%-20s %s\n' "$name" "${!var}"
+  done < <(compgen -v 2>/dev/null | grep '^IWORK_REPO_GROUP_' | sort)
+
+  [[ -n "$any" ]] || { echo ""; echo "No repo groups. 'iwork config group set <name> <repo>...' makes one."; }
+}
+
+cmd_config_group() {
+  local sub="${1:-list}"
+  local name=""
+  local key=""
+
+  case "$sub" in
+    list|"")
+      require_config
+      config_show_groups
+      ;;
+    set)
+      shift
+      name="${1:-}"
+      shift || true
+      [[ -n "$name" && $# -gt 0 ]] ||
+        die "usage: iwork config group set <name> <repo> [repo ...]"
+      require_config
+      key="IWORK_REPO_GROUP_$(printf '%s' "$name" | tr '[:lower:]-' '[:upper:]_')"
+      validate_config_value "$key" "$*"
+      config_file_write "$key" "$*"
+      echo "Set @$name = $*"
+      echo "  in $IWORK_CONFIG_FILE"
+      ;;
+    rm|unset)
+      shift
+      name="${1:-}"
+      [[ -n "$name" ]] || die "usage: iwork config group rm <name>"
+      require_config
+      key="IWORK_REPO_GROUP_$(printf '%s' "$name" | tr '[:lower:]-' '[:upper:]_')"
+      config_file_remove "$key" || die "no repo group '$name' in $IWORK_CONFIG_FILE"
+      echo "Removed @$name"
+      ;;
+    *)
+      die "usage: iwork config group [list | set <name> <repo>... | rm <name>]"
+      ;;
+  esac
+}
+
+cmd_config() {
+  local sub="${1:-}"
+  local key=""
+  local value=""
+
+  case "$sub" in
+    ""|list)
+      require_config
+      config_show_all
+      ;;
+    path)
+      printf '%s\n' "$IWORK_CONFIG_FILE"
+      ;;
+    edit)
+      [[ -n "${EDITOR:-${VISUAL:-}}" ]] ||
+        die "no EDITOR or VISUAL set; the file is $IWORK_CONFIG_FILE"
+      mkdir -p "$(dirname "$IWORK_CONFIG_FILE")" 2>/dev/null || true
+      exec ${EDITOR:-$VISUAL} "$IWORK_CONFIG_FILE"
+      ;;
+    group|groups)
+      shift
+      cmd_config_group "$@"
+      ;;
+    get)
+      shift
+      [[ $# -eq 1 ]] || die "usage: iwork config get <setting>"
+      key="$(config_key_from_arg "$1")" || die "no such setting: $1
+$(config_keys_hint)"
+      printf '%s\n' "$(config_effective_value "$key")"
+      ;;
+    set)
+      shift
+      [[ $# -ge 2 ]] || die "usage: iwork config set <setting> <value>"
+      key="$(config_key_from_arg "$1")" || die "no such setting: $1
+$(config_keys_hint)"
+      shift
+      value="$*"
+      require_config
+      validate_config_value "$key" "$value"
+      config_file_write "$key" "$value"
+      echo "Set $key=\"$value\""
+      echo "  in $IWORK_CONFIG_FILE"
+      # An 'if', not a '&&': the && form returns 1 when the test is false, that
+      # is the last command in this function, and 'set -e' then takes the
+      # process after it has already printed that the write succeeded.
+      if config_from_env "$key"; then
+        warn "$key is also set in your environment, which wins over the file"
+      fi
+      ;;
+    unset)
+      shift
+      [[ $# -eq 1 ]] || die "usage: iwork config unset <setting>"
+      key="$(config_key_from_arg "$1")" || die "no such setting: $1
+$(config_keys_hint)"
+      config_file_remove "$key" || die "$key is not set in $IWORK_CONFIG_FILE"
+      echo "Unset $key in $IWORK_CONFIG_FILE"
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    *)
+      die "usage: iwork config [list | get <setting> | set <setting> <value> |
+                    unset <setting> | group ... | path | edit]"
+      ;;
+  esac
 }
 
 # --- capture -----------------------------------------------------------------
@@ -5238,10 +5816,24 @@ master_remote_control_name() {
   local tool="${2:-claude}"
 
   [[ "$tool" == "claude" ]] || return 1
-  case "$IWORK_MASTER_REMOTE_CONTROL" in
-    on) printf '%s (master)\n' "$project" ;;
+  case "$(printf '%s' "$IWORK_MASTER_REMOTE_CONTROL" | tr '[:upper:]' '[:lower:]')" in
+    1|on|yes|true) ;;
     *) return 1 ;;
   esac
+
+  # 'iwork master' only takes plain names, but resurrect and update-agents walk
+  # every directory under the projects dir, hand-made ones too. Spaces and quotes
+  # survive %q; these do not: a leading '=' is a command lookup to zsh, a leading
+  # '-' reads to claude as an option rather than the name, and control
+  # characters come out of %q as $'...', which dash does not know.
+  case "$project" in
+    -*|=*|*[[:cntrl:]]*)
+      warn "master of '$project': no Remote Control, the name is not safe to type into a shell"
+      return 1
+      ;;
+  esac
+
+  printf '%s (master)\n' "$project"
 }
 
 # A master's resume line: the tool's own, plus the flag it was started with.
@@ -6698,6 +7290,10 @@ run_init() {
     echo '# IWORK_PROJECTS_TMUX_SESSION=projects'
     echo '# IWORK_REPOS_TMUX_SESSION=repos'
     echo '# IWORK_UPDATE_COMMAND=        # how "iwork update" upgrades Claude Code'
+    echo '# IWORK_REPO_GROUP_MYGROUP=   # "repo-one repo-two", used as -r @mygroup'
+    echo '# IWORK_AGENT=claude          # the CLI a new task starts'
+    echo '# IWORK_AGENT_ARGS_CLAUDE=     # params handed to it every time'
+    echo '# IWORK_AGENT_ARGS_CODEX='
     echo '# IWORK_SESSION_MARKERS=off   # on = put the agent marker on session'
     echo '#                             # names too (UNSTABLE: see iwork -h)'
     echo '# IWORK_MASTER_REMOTE_CONTROL=off  # on = masters start with Claude'
@@ -7185,6 +7781,12 @@ case "${1:-}" in
   --complete-repos)
     require_config
     list_repos "${2:-}"
+    # Groups complete alongside repos, since '-r' takes either and a group you
+    # cannot remember the name of is a group you will not use.
+    while IFS= read -r complete_group; do
+      [[ -n "$complete_group" ]] || continue
+      [[ "@$complete_group" == "${2:-}"* ]] && printf '@%s\n' "$complete_group"
+    done < <(list_repo_groups)
     exit 0
     ;;
   --complete-worktree-folders)
@@ -7286,6 +7888,12 @@ if [[ "${1:-}" == "init" ]]; then
   fi
 
   run_init
+  exit 0
+fi
+
+if [[ "${1:-}" == "config" ]]; then
+  shift
+  cmd_config "$@"
   exit 0
 fi
 
@@ -7500,6 +8108,27 @@ if [[ "${1:-}" == "add-repo" ]]; then
 
   warn_message_undelivered "add-repo does not start an agent"
 
+  # A repo the task already has is said and skipped rather than being fatal.
+  # Before repo groups that was a rare typo; '-r @claims' on a task that has one
+  # of the group makes it the ordinary case, and dying on it would mean the
+  # shorthand fails the second time you use it.
+  add_repo_keep=()
+  for add_repo_name in "${repos[@]+${repos[@]}}"; do
+    if [[ -e "$TASKS_DIR/$folder_name/$add_repo_name" ]]; then
+      echo "  $add_repo_name: already in this task, left alone"
+      continue
+    fi
+    add_repo_keep+=("$add_repo_name")
+  done
+
+  if (( ${#add_repo_keep[@]} == 0 )); then
+    echo ""
+    echo "Nothing to add; every repo named is already in '$folder_name'."
+    exit 0
+  fi
+
+  repos=("${add_repo_keep[@]}")
+
   # Normally the branch is read off the worktrees already there. A task whose
   # repos have drifted onto different branches has no single answer, so -b is
   # how you give it one.
@@ -7552,7 +8181,11 @@ if [[ "${1:-}" == "master" && "${2:-}" != "-r" ]]; then
   # own link, then the project you are standing in, then IWORK_PROJECT.
   resolve_project_context "$master_project"
 
-  agent_message_args
+  # A master stays claude whatever IWORK_AGENT says: its brief arrives through
+  # the Claude SessionStart hook, so a codex master would come up as an ordinary
+  # agent sitting in a directory of markdown, which is the thing start_master
+  # already warns about when the hooks are missing.
+  agent_message_args claude
   start_master "$RESOLVED_PROJECT"
   exit 0
 fi
@@ -7563,7 +8196,7 @@ if [[ "${1:-}" == "claude" && "${2:-}" != "-r" ]]; then
   fi
 
   reject_trailing_message_flag claude "${@:3}"
-  agent_message_args
+  agent_message_args claude
   run_tool_in_worktree claude "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
 
@@ -7573,7 +8206,7 @@ if [[ "${1:-}" == "codex" && "${2:-}" != "-r" ]]; then
   fi
 
   reject_trailing_message_flag codex "${@:3}"
-  agent_message_args
+  agent_message_args codex
   run_tool_in_worktree codex "$2" "${@:3}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
 fi
 
@@ -7622,5 +8255,5 @@ if [[ -n "$PROJECT_FLAG" ]]; then
   attach_task_to_project "$folder_name" "$PROJECT_FLAG" "$branch"
 fi
 
-agent_message_args
-open_task "$folder_name" claude ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+agent_message_args "$IWORK_AGENT"
+open_task "$folder_name" "$IWORK_AGENT" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}

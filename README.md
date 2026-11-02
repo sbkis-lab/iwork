@@ -642,6 +642,13 @@ the flag into the command they restart a master with; without that, the first
 restart would quietly drop it off the phone, which is exactly when nobody is at
 the terminal to notice.
 
+A restart follows the config as it is now, not how the master was started: a
+master started with the setting only in the environment comes back without it,
+and turning it on in the config adds it to masters that never had it. A
+hand-made project directory whose name starts with `=` or `-`, or holds control
+characters, gets no Remote Control (with a warning): those names cannot be typed
+into a shell safely.
+
 Only masters get it. A project is the thing you steer from a phone, and its
 tasks are reached through its master — a dozen task sessions in the app would
 bury the one that matters. Only claude, because the flag is claude's.
@@ -879,6 +886,70 @@ session you start by hand *inside* a worktree is rooted there and sees that
 repo's skills only — the same as any ordinary checkout. Run agents from the task
 root and everything is in scope.
 
+## Which CLI a task runs
+
+iwork ran `claude`, and only `claude`. `iwork codex <task>` could open a task
+that already existed, but nothing could create one — so a codex task was a thing
+you could not get to:
+
+```
+$ iwork codex review/vignirs-prs -r accounting-api finance-frontend
+Error: folder 'review/vignirs-prs' must be a direct child of ~/dev/projects/tasks
+```
+
+Two separate problems in one line: `codex <task>` opens an existing task rather
+than creating one, and the task argument was being read as a folder name when it
+was written as a branch.
+
+### The default, and the exceptions
+
+```sh
+IWORK_AGENT=claude              # what a new task starts
+IWORK_AGENT_ARGS_CLAUDE=        # handed to it on every start
+IWORK_AGENT_ARGS_CODEX=
+```
+
+`--agent <cli>` overrides the default for one invocation:
+
+```bash
+iwork --agent codex review/vignirs-prs -r accounting-api finance-frontend
+```
+
+A flag you always want belongs in the config rather than in your fingers:
+
+```sh
+IWORK_AGENT_ARGS_CODEX="--full-auto"
+```
+
+iwork knows `claude` and `codex`; anything else is refused by name rather than
+failing later with whatever that binary says about arguments it did not expect.
+
+A **first prompt** is shaped for the CLI it goes to — `claude` reads it after a
+`--`, `codex` takes it as its argument. That is iwork's job to know, not yours,
+so `-m` works the same either way:
+
+```bash
+iwork --agent codex fix/login -r auth-service -m 'Sentry AUTH-42: why does login 500?'
+```
+
+A project's **master is always claude**, whatever `IWORK_AGENT` says: its brief
+arrives through the Claude `SessionStart` hook, and nothing else reads it.
+
+### Naming a task the way you created it
+
+A task folder is its branch with the slashes flattened — `feat/login-bug`
+becomes `feat-login-bug`. That mapping was only ever applied in one direction,
+so typing the name you created the task with got you "must be a direct child",
+which is true and explains nothing. Both spellings work now:
+
+```bash
+iwork codex feat/login-bug      # the branch
+iwork codex feat-login-bug      # the folder
+```
+
+And when a name really has nowhere to go, the error says what the folder for it
+would have been called.
+
 ## Branch tracking
 
 A task branch is created from `origin/main` (or whatever `origin/HEAD` points at),
@@ -905,6 +976,77 @@ inside the worktree:
 ```bash
 git branch --unset-upstream
 ```
+
+## Repo groups: a name for a combination you keep typing
+
+A task usually spans the same few repos. Naming them every time is the part that
+gets old:
+
+```bash
+iwork feat/claims-x -r rent-api accounting-api contracts-api
+iwork feat/claims-y -r rent-api accounting-api contracts-api
+```
+
+Give the combination a name:
+
+```bash
+iwork config group set claims rent-api accounting-api contracts-api
+iwork config group set rent-stack rent-api rent-frontend-v2
+```
+
+which writes it to `~/.config/iwork/config`, where you can equally put it by
+hand:
+
+```sh
+IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api contracts-api"
+IWORK_REPO_GROUP_RENT_STACK="rent-api rent-frontend-v2"
+```
+
+```bash
+iwork feat/claims-x -r @claims                   # the three of them
+iwork feat/claims-x -r @claims email-templates   # and one more
+iwork add-repo feat-claims-x -r @rent-stack      # into a task that exists
+```
+
+One variable per group rather than one list of all of them: it reads as config
+rather than as a format, and it is the same shape as `IWORK_AGENT_ARGS_<CLI>`.
+A group name with a dash maps the obvious way — `@rent-stack` is
+`IWORK_REPO_GROUP_RENT_STACK`.
+
+### Why the `@`
+
+A group and a repo are allowed to share a name. Without the sigil, whichever
+happened to exist would quietly decide what you meant — and the day you add a
+repo called `claims`, every task you make with `-r claims` silently changes
+shape. `@` says which you meant, always.
+
+An unknown group is refused with the variable to set **and the groups you do
+have**, which is the thing you actually want when you have mistyped one:
+
+```
+Error: no repo group 'claim'. Define it in ~/.config/iwork/config:
+  IWORK_REPO_GROUP_CLAIM="repo-one repo-two"
+  Groups you have defined: claims rent-stack
+```
+
+### Overlap is not an error
+
+Repeats are dropped, so `-r @claims rent-api` is the group plus anything it did
+not already include.
+
+`add-repo` now **skips a repo the task already has** and says which, rather than
+failing outright:
+
+```
+  rent-api: already in this task, left alone
+  -> accounting-api (branch: feat/claims-x, from origin/main)
+```
+
+Before groups that case was a rare typo. With them it is ordinary — `-r @claims`
+into a task already holding one of the three — and dying on it would mean the
+shorthand breaks the second time you use it.
+
+Groups complete alongside repos, so `-r @<tab>` offers them.
 
 ## Stacking a task on earlier work
 
@@ -1507,6 +1649,9 @@ overrides.
 | `IWORK_PROJECT_TEMPLATE` | `~/.config/iwork/project-context.md.tmpl` | Template for the project block injected into those files (same deal: seeded once, then yours) |
 | `IWORK_PROJECT` | unset | Fallback project for `todo`/`log`/`decided`/`done`/`drop`. A task's own `.project` link always wins over it; `-p` wins over both |
 | `IWORK_ENTRY_MAX_CHARS` | `800` | Longest `todo`/`log`/`decided` entry. Anything longer is truncated with a marker, since `project show` prints entries back and the `SessionStart` hook injects them into every session |
+| `IWORK_REPO_GROUP_<NAME>` | none | A repo combination usable as `-r @<name>`, e.g. `IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api"` |
+| `IWORK_AGENT` | `claude` | The CLI a new task starts. `claude` or `codex`; `--agent <cli>` overrides it per invocation |
+| `IWORK_AGENT_ARGS_CLAUDE`, `IWORK_AGENT_ARGS_CODEX` | empty | Params handed to that CLI every time iwork starts it |
 | `IWORK_UPDATE_CLAUDE`, `IWORK_UPDATE_CODEX` | detected | The command `iwork update-agents` runs to upgrade that agent. Empty means work it out from where its binary lives |
 | `IWORK_RESUME_CLAUDE`, `IWORK_RESUME_CODEX` | per agent | How that agent is told to resume. Defaults to `claude --continue` and `codex resume --last` |
 | `IWORK_MASTER_REMOTE_CONTROL` | `off` | `on` starts a claude master with Remote Control, named `<project> (master)` — see [Reaching a master from your phone](#reaching-a-master-from-your-phone) |
@@ -1521,6 +1666,83 @@ overrides.
 
 Leading flags `--no-tmux`, `--no-context`, `--detach` and `--big` apply
 per-invocation, e.g. `iwork --no-tmux claude feat-login-bug`.
+
+## `iwork config`: the settings, without opening the file
+
+The config file is plain shell and always has been, which is fine until you want
+to change one thing in it. You open it, hope you remember what the setting is
+called, and find out whether you got it right the next time something breaks.
+
+```bash
+iwork config                      # every setting, its value, and where it came from
+iwork config get agent
+iwork config set agent codex
+iwork config unset agent
+iwork config path                 # the file itself
+iwork config edit                 # open it in $EDITOR anyway
+```
+
+```
+~/.config/iwork/config
+
+IWORK_REPO_DIR               /Users/me/repos                 config
+IWORK_TASKS_DIR              /Users/me/repos/tasks           default
+IWORK_TMUX_SESSION           tasks                           default
+IWORK_AGENT                  codex                           environment
+...
+```
+
+Three things it does that editing the file does not:
+
+- **It shows what you are actually getting.** `IWORK_TASKS_DIR` is usually
+  nothing in the file and `$IWORK_REPO_DIR/tasks` in practice; printing the
+  variable would report it unset, which is the opposite of the point.
+- **It says where each value came from** — the file, the environment, or a
+  default. Writing a setting your environment overrides looks like it worked and
+  then does nothing, so `set` warns when that is what you just did.
+- **It checks the value before writing it.** `iwork config set agent emacs` is
+  refused with the agents that exist, rather than failing the next time you make
+  a task.
+
+Names are taken in any case and with or without the prefix, so `agent`, `AGENT`
+and `IWORK_AGENT` are the same setting.
+
+### It leaves the rest of the file alone
+
+Writing a setting rewrites one line. Everything else — your comments, your
+ordering — stays where it was. A **commented example is replaced in place**
+rather than appended past, so a file written by `iwork init` keeps its shape
+instead of growing a second copy of every setting at the bottom:
+
+```sh
+# IWORK_AGENT=claude          # the CLI a new task starts
+```
+
+becomes
+
+```sh
+IWORK_AGENT="codex"   # the CLI a new task starts
+```
+
+The sentence beside a commented example is usually the only documentation of
+what the setting does, so it is kept.
+
+### Repo groups
+
+```bash
+iwork config group                              # list them
+iwork config group set claims rent-api accounting-api
+iwork config group rm claims
+```
+
+Which is the same as writing `IWORK_REPO_GROUP_CLAIMS="rent-api accounting-api"`
+by hand, with the name mapping done for you and the repos checked — a repo that
+is not there is named, though still written, since naming one you are about to
+clone is reasonable.
+
+What a group is *for* is
+[Repo groups](#repo-groups-a-name-for-a-combination-you-keep-typing): using it
+as `-r @claims` when you make a task.
 
 ## Tests
 
