@@ -4686,13 +4686,18 @@ SH
   WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
 
   local waited=0
-  while (( waited < 80 )) && [[ "$(wc -l < "$SB/claude-env" 2>/dev/null | tr -d ' ')" != 2 ]]; do
+  while (( waited < 80 )) && [[ "$({ wc -l < "$SB/claude-env"; } 2>/dev/null | tr -d ' ')" != 2 ]]; do
     command sleep 0.1
     waited=$((waited + 1))
   done
   assert_eq "both agent panes start with the update check off" \
     "auto=true prompt=true
 auto=true prompt=true" "$(cat "$SB/claude-env" 2>/dev/null)"
+  # The session keeps none of it, so the operator's own windows there still get
+  # oh-my-zsh's updates, and feat-two had it from new-window -e, not from the
+  # session feat-one made.
+  assert_eq "the session environment is left clean" "" \
+    "$(tmux_t show-environment -t '=tasks' 2>/dev/null | grep '^DISABLE_' || true)"
 }
 
 # 'tmux new-session -e' is tmux 3.2; before that iwork passes no environment.
@@ -4742,12 +4747,12 @@ SH
   WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
 
   local waited=0
-  while (( waited < 50 )) && [[ "$(wc -l < "$SB/claude-argv" 2>/dev/null | tr -d ' ')" != 2 ]]; do
+  while (( waited < 50 )) && [[ "$({ wc -l < "$SB/claude-argv"; } 2>/dev/null | tr -d ' ')" != 2 ]]; do
     command sleep 0.1
     waited=$((waited + 1))
   done
   assert_eq "both agents start, with no key eaten" "2" \
-    "$(wc -l < "$SB/claude-argv" 2>/dev/null | tr -d ' ')"
+    "$({ wc -l < "$SB/claude-argv"; } 2>/dev/null | tr -d ' ')"
 }
 
 # Asking tmux its version must not take iwork down where there is no tmux.

@@ -3938,6 +3938,7 @@ move_window_to_session() {
       warn "could not create tmux session '$base' for '$window_name'"
       return 1
     fi
+    clear_session_env "$placeholder"
 
     merge_duplicate_sessions "$base"
     target="$(resolve_session_name "$base" || printf '%s' "$base")"
@@ -5450,9 +5451,8 @@ project_grep() {
 #
 # 'tmux -e' came to new-window and split-window in 3.0 and to new-session in
 # 3.2; older tmux, or a version string that does not parse, gets nothing rather
-# than a window that fails to open. new-session -e sets them for the whole
-# session, so later windows in an iwork session have them too: harmless, since
-# all it does is skip oh-my-zsh's update check there.
+# than a window that fails to open. (tmux -V is the client's version; a server
+# left running from before an upgrade could still be older.)
 PANE_ENV=()
 SESSION_ENV=()
 pane_env_init() {
@@ -5473,6 +5473,17 @@ pane_env_init() {
   PANE_ENV=(-e DISABLE_AUTO_UPDATE=true -e DISABLE_UPDATE_PROMPT=true)
   (( major > 3 || minor >= 2 )) || return 0
   SESSION_ENV=("${PANE_ENV[@]}")
+}
+
+# new-session -e also writes the variables into the session's environment, so
+# every later shell in it would skip oh-my-zsh's updates for good, the
+# operator's own windows included. The first pane already has them, and iwork
+# hands PANE_ENV to every window it adds, so take them back out. $1 is any
+# target in the session, such as the window just made.
+clear_session_env() {
+  (( ${#SESSION_ENV[@]} )) || return 0
+  tmux set-environment -t "$1" -u DISABLE_AUTO_UPDATE \; \
+    set-environment -t "$1" -u DISABLE_UPDATE_PROMPT 2>/dev/null || true
 }
 
 # The window an agent runs in: the tool on the left, a shell on the right, both
@@ -5523,6 +5534,7 @@ spawn_agent_window() {
       warn "could not create tmux session '$session'"
       return 1
     fi
+    clear_session_env "$window_id"
 
     # A marked twin may have appeared while we were deciding there was none.
     merge_duplicate_sessions "$session"
@@ -5728,6 +5740,7 @@ open_task_session() {
       warn "could not create tmux session '$session'"
       return 0
     fi
+    clear_session_env "$window_id"
     created=1
 
     # Folding into a twin leaves the name we just used pointing at nothing, so
@@ -6210,6 +6223,7 @@ open_repo_window() {
       warn "could not create tmux session '$REPOS_SESSION'"
       return 1
     fi
+    clear_session_env "$window_id"
   fi
 
   tmux set-option -w -t "$window_id" @iwork_repo "$repo" 2>/dev/null || true
