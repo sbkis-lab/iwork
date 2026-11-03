@@ -4692,6 +4692,48 @@ SH
     "$([[ -s "$SB/claude-argv" ]] && echo yes || echo no)"
 }
 
+test_spawned_panes_turn_off_the_oh_my_zsh_update_prompt() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  case "$(tmux -V 2>/dev/null)" in
+    "tmux "[0-2].*|"tmux 3."[01]*) printf '    skip (tmux before 3.2 gets no -e)\n'; return 0 ;;
+  esac
+  mk_repo backend
+
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+printf 'auto=%s prompt=%s\n' "\$DISABLE_AUTO_UPDATE" "\$DISABLE_UPDATE_PROMPT" >> "$SB/claude-env"
+exit 0
+STUB
+  chmod +x "$SB/bin/claude"
+
+  # A plain sh that keeps the pane's environment, which is the thing under test,
+  # but not the operator's PATH: their shell startup would put a real claude
+  # ahead of the stub.
+  cat > "$SB/bin/plainsh" <<SH
+#!/bin/sh
+exec env -u ENV PATH="$SB/bin:/usr/bin:/bin" /bin/sh
+SH
+  chmod +x "$SB/bin/plainsh"
+
+  # Whatever the operator's own environment holds must not make this pass.
+  tmux_t start-server \; set -s exit-empty off \; set -g default-shell "$SB/bin/plainsh" \; \
+    set-environment -gu DISABLE_AUTO_UPDATE \; set-environment -gu DISABLE_UPDATE_PROMPT >/dev/null 2>&1
+
+  # The first task makes the session, the second adds a window to it: both ways
+  # a pane is created.
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+
+  local waited=0
+  while (( waited < 80 )) && [[ "$(wc -l < "$SB/claude-env" 2>/dev/null | tr -d ' ')" != 2 ]]; do
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  assert_eq "both agent panes start with the update check off" \
+    "auto=true prompt=true
+auto=true prompt=true" "$(cat "$SB/claude-env" 2>/dev/null)"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
