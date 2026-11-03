@@ -3934,7 +3934,7 @@ move_window_to_session() {
   local placeholder=""
 
   if ! target="$(resolve_session_name "$base")"; then
-    if ! placeholder="$(tmux new-session ${PANE_ENV[@]+"${PANE_ENV[@]}"} -d -s "$base" -c "$TASKS_DIR" -P -F '#{window_id}' 2>/dev/null)"; then
+    if ! placeholder="$(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$base" -c "$TASKS_DIR" -P -F '#{window_id}' 2>/dev/null)"; then
       warn "could not create tmux session '$base' for '$window_name'"
       return 1
     fi
@@ -5441,50 +5441,45 @@ project_grep() {
   fi
 }
 
+# Environment for the panes iwork creates, most of which it then types a
+# command into. oh-my-zsh asks "Would you like to update? [Y/n]" at shell start,
+# and that question reads one key: the first byte of the command iwork types, so
+# 'claude' runs as 'laude'. These turn the check off. oh-my-zsh honours them only
+# when ~/.zshrc sets no zstyle ':omz:update' mode and does not assign them
+# itself; a zstyle set to prompt still asks, and wins.
+#
+# 'tmux -e' came to new-window and split-window in 3.0 and to new-session in
+# 3.2; older tmux, or a version string that does not parse, gets nothing rather
+# than a window that fails to open. new-session -e sets them for the whole
+# session, so later windows in an iwork session have them too: harmless, since
+# all it does is skip oh-my-zsh's update check there.
+PANE_ENV=()
+SESSION_ENV=()
+pane_env_init() {
+  local version=""
+  local major=""
+  local minor=""
+
+  [[ -z "${PANE_ENV_DONE:-}" ]] || return 0
+  PANE_ENV_DONE=1
+  # Two steps: a missing tmux fails the pipeline, which pipefail and set -e
+  # would turn into iwork exiting.
+  version="$(tmux -V 2>/dev/null || true)"
+  [[ "$version" =~ ^tmux\ ([0-9]+)\.([0-9]+) ]] || return 0
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+
+  (( major >= 3 )) || return 0
+  PANE_ENV=(-e DISABLE_AUTO_UPDATE=true -e DISABLE_UPDATE_PROMPT=true)
+  (( major > 3 || minor >= 2 )) || return 0
+  SESSION_ENV=("${PANE_ENV[@]}")
+}
+
 # The window an agent runs in: the tool on the left, a shell on the right, both
 # rooted at $dir, creating $session if it is not there yet. Prints the window id.
 #
 # Finding an existing window is the caller's job, not this function's: a task can
 # be in either of two sessions while a master is only ever in one.
-# Environment for every pane iwork types a command into. oh-my-zsh asks
-# "Would you like to update? [Y/n]" at shell start, and that question reads one
-# key: the first byte of the command iwork types, so 'claude' runs as 'laude'.
-# These turn the check off in iwork's panes only. oh-my-zsh honours them only
-# when ~/.zshrc sets no zstyle ':omz:update' mode; a zstyle set to prompt still
-# asks, and wins. 'tmux -e' needs tmux 3.2 for new-session, so older tmux gets
-# nothing rather than a window that fails to open.
-PANE_ENV=()
-pane_env_init() {
-  local version=""
-
-  [[ -z "${PANE_ENV_DONE:-}" ]] || return 0
-  PANE_ENV_DONE=1
-  version="$(tmux -V 2>/dev/null | sed -n 's/^tmux \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')"
-  [[ -n "$version" ]] || return 0
-  set -- $version
-  (( $1 > 3 || ($1 == 3 && $2 >= 2) )) || return 0
-  PANE_ENV=(-e DISABLE_AUTO_UPDATE=true -e DISABLE_UPDATE_PROMPT=true)
-}
-
-# A new pane's shell is still starting when tmux hands back its id, and keys
-# sent before it reaches its prompt can be lost: a zsh whose startup queries the
-# terminal or flushes pending input eats the typeahead, often just its first
-# byte, so 'claude' arrives as 'laude' (seen on 3 of 3 detached spawns on
-# 2026-10-22). Wait until the pane has drawn something -- the prompt -- and give
-# up after a few seconds, sending anyway, so a silent prompt costs a delay
-# rather than the agent.
-wait_for_pane_prompt() {
-  local pane="$1"
-  local waited=0
-
-  while (( waited < 50 )); do
-    [[ -z "$(tmux capture-pane -p -t "$pane" 2>/dev/null | tr -d '[:space:]')" ]] || return 0
-    command sleep 0.1
-    waited=$((waited + 1))
-  done
-  return 0
-}
-
 spawn_agent_window() {
   pane_env_init
   local first=""
@@ -5524,7 +5519,7 @@ spawn_agent_window() {
       return 1
     fi
   else
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${PANE_ENV[@]+"${PANE_ENV[@]}"} -d -s "$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux session '$session'"
       return 1
     fi
@@ -5537,7 +5532,6 @@ spawn_agent_window() {
   tmux select-pane -t "$pane_id" 2>/dev/null || true
 
   printf -v tool_cmd '%q ' "$tool" "$@"
-  wait_for_pane_prompt "$pane_id"
   tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$name'"
 
   printf '%s\n' "$window_id"
@@ -5730,7 +5724,7 @@ open_task_session() {
 
     # The agent window keeps the task name so the Claude status hooks still
     # recognise it (*task busy, !task waiting).
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${PANE_ENV[@]+"${PANE_ENV[@]}"} -d -s "$session" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$session" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux session '$session'"
       return 0
     fi
@@ -5745,7 +5739,6 @@ open_task_session() {
     tmux select-pane -t "$pane_id" 2>/dev/null || true
 
     printf -v tool_cmd '%q ' "$tool" "$@"
-    wait_for_pane_prompt "$pane_id"
     tmux send-keys -t "$pane_id" "$tool_cmd" Enter 2>/dev/null || warn "could not start $tool in tmux window '$folder'"
   fi
 
@@ -6213,7 +6206,7 @@ open_repo_window() {
       return 1
     fi
   else
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${PANE_ENV[@]+"${PANE_ENV[@]}"} -d -s "$REPOS_SESSION" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$REPOS_SESSION" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux session '$REPOS_SESSION'"
       return 1
     fi
