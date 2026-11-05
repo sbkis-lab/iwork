@@ -3164,6 +3164,76 @@ test_resurrect_keeps_a_master_window() {
     "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
 }
 
+test_resurrect_brings_masters_back_after_the_server_died() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  # alpha: had a master, has tasks. beta: tasks, never a master.
+  # gamma: had a master, no tasks left.
+  WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r frontend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/three -r backend -p beta >/dev/null 2>&1
+  iw project new gamma >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach master alpha >/dev/null 2>&1
+  local p=""
+  for p in alpha gamma; do
+    printf '2026-11-05T19:00:00+0000\tregistered\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\n' "$p" \
+      >> "$SB_PROJECTS/$p/agents.tsv"
+    printf '2026-11-05T19:48:44+0000\tended\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\n' "$p" \
+      >> "$SB_PROJECTS/$p/agents.tsv"
+  done
+
+  # The server dies and takes every window with it. tmux_t clears $TMUX, so
+  # this is the sandbox's server and nobody else's.
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+
+  assert_contains "alpha's master is reported back" "master of 'alpha': opened" "$out"
+  assert_eq "alpha's master is the first window again" "alpha" \
+    "$(tmux_t list-windows -t '=projects-alpha' -F '#{window_index} #{window_name}' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2)"
+  assert_contains "alpha's tasks are back too" "feat-two" "$(windows_of_session projects-alpha)"
+
+  local pane="" i=""
+  pane="$(tmux_t list-panes -t '=projects-alpha:alpha' -F '#{pane_id}' 2>/dev/null | head -1)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    tmux_t capture-pane -p -t "$pane" 2>/dev/null | tr -d ' \n' | grep -q 'claude--continue' && break
+    sleep 0.2
+  done
+  # Squeezed: the shell wraps the line in a narrow pane wherever it likes.
+  assert_contains "on its last conversation" "claude--continue" \
+    "$(tmux_t capture-pane -p -t "$pane" 2>/dev/null | tr -d ' \n')"
+
+  case "$(windows_of_session projects-beta)" in
+    *beta*) bad "a project that never had a master got one" ;;
+    *) ok ;;
+  esac
+  assert_contains "beta is told how to start one" "project 'beta' has no master" "$out"
+  assert_eq "a project with no tasks left gets no master" "" "$(windows_of_session projects-gamma)"
+
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_eq "a second resurrect makes no second master" "1" \
+    "$(tmux_t list-windows -t '=projects-alpha' -F '#{window_name}' 2>/dev/null | grep -cx alpha | tr -d ' ')"
+}
+
+test_resurrect_dry_run_names_the_master_it_would_reopen() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r frontend -p alpha >/dev/null 2>&1
+  printf '2026-11-05T19:00:00+0000\tregistered\t\tsess-a\t1\t%%1\t/x.jsonl\tmaster\n' >> "$SB_PROJECTS/alpha/agents.tsv"
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect -n 2>&1)"
+  assert_contains "dry run names it" "master of 'alpha': would open" "$out"
+  assert_eq "and opens nothing" "" "$(windows_of_session projects-alpha)"
+}
+
 test_resurrect_gathers_a_projects_task_back_into_its_session() {
   command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
   mk_repo backend

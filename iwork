@@ -6703,6 +6703,38 @@ resurrect_find_master() {
   printf '%s\n' "${line%% *}"
 }
 
+# Whether a project has ever had a master. agents.tsv cannot say whether the
+# last one was closed on purpose or died with the server: both end with an
+# 'ended' row, since the SessionEnd hook fires on a hangup too.
+project_had_master() {
+  local file="$PROJECTS_DIR/$1/agents.tsv"
+
+  [[ -f "$file" ]] || return 1
+  awk -F'\t' '$8 == "master" { found = 1 } END { exit !found }' "$file"
+}
+
+# A dead server takes every master window with it, and resurrect used to bring
+# back only masters whose window had survived, i.e. none, after the one event
+# it exists for. A project that has had a master and still has tasks gets its
+# master back, on its last conversation; one whose work is done does not.
+resurrect_reopen_master() {
+  local project="$1"
+  local cmd=()
+
+  read -r -a cmd <<< "$(resurrect_agent_cmd)"
+
+  if [[ -n "$RESURRECT_DRY" ]]; then
+    echo "  master of '$project': would open its window running '${cmd[*]}'"
+    return 0
+  fi
+
+  if ! spawn_agent_window --first "$(project_session_name "$project")" "$project" "$PROJECTS_DIR/$project" "${cmd[@]}" >/dev/null; then
+    warn "master of '$project': could not open its window"
+    return 1
+  fi
+  echo "  master of '$project': opened its window running '${cmd[*]}'"
+}
+
 resurrect_projects() {
   local project=""
   local window_id=""
@@ -6716,6 +6748,8 @@ resurrect_projects() {
     if window_id="$(resurrect_find_master "$project")"; then
       pane="$(window_agent_pane "$window_id")"
       [[ -z "$pane" ]] || resurrect_start_agent "$pane" "master of '$project'"
+    elif project_had_master "$project" && [[ -n "$(project_tasks_live "$project")" ]]; then
+      resurrect_reopen_master "$project" || true
     else
       echo "  project '$project' has no master; start one with: iwork master $project"
     fi
