@@ -474,6 +474,56 @@ test_project_created_on_first_use() {
   assert_grep "opened event names the task" "feat-one" "$SB_PROJECTS/myproj/history.tsv"
 }
 
+test_project_new_creates_without_asking() {
+  # ASSUME_YES= makes confirm() die for want of a terminal, which is what a
+  # Remote Control or systemd session sees; 'project new' must not ask at all.
+  ASSUME_YES= iw project new alpha </dev/null >/dev/null 2>&1
+  ASSUME_YES= iw project new beta </dev/null >/dev/null 2>&1
+
+  assert_file "alpha PROJECT.md seeded" "$SB_PROJECTS/alpha/PROJECT.md"
+  assert_file "alpha LOG.md seeded" "$SB_PROJECTS/alpha/LOG.md"
+  assert_dir "alpha notes/ seeded" "$SB_PROJECTS/alpha/notes"
+  assert_file "beta PROJECT.md seeded" "$SB_PROJECTS/beta/PROJECT.md"
+  local out
+  out="$(iw project list 2>&1)"
+  assert_contains "alpha listed" "alpha" "$out"
+  assert_contains "beta listed" "beta" "$out"
+}
+
+test_project_new_refuses_an_existing_project() {
+  iw project new alpha >/dev/null 2>&1
+  printf 'hand-written goal\n' >> "$SB_PROJECTS/alpha/PROJECT.md"
+
+  assert_fails "same name refused" iw project new alpha
+  assert_fails "same name in another case refused" iw project new ALPHA
+  # By listing, not by path: on a case-insensitive filesystem ALPHA "exists".
+  assert_eq "no case twin created" "alpha" "$(ls "$SB_PROJECTS")"
+  assert_grep "existing PROJECT.md untouched" "hand-written goal" "$SB_PROJECTS/alpha/PROJECT.md"
+}
+
+test_project_new_refuses_bad_names_and_tasks() {
+  mk_repo backend
+  iw feat/clash -r backend >/dev/null 2>&1
+  assert_fails "named after a task" iw project new feat-clash
+  assert_fails "slash refused" iw project new 'a/b'
+  assert_fails "marker prefix refused" iw project new '*bad'
+  assert_fails "no name" iw project new
+  assert_fails "two names" iw project new one two
+  assert_no_file "nothing called one" "$SB_PROJECTS/one"
+}
+
+test_project_new_then_task_joins_without_asking() {
+  mk_repo backend
+  mk_repo frontend
+  ASSUME_YES= iw project new myproj </dev/null >/dev/null 2>&1
+  # -p on an existing project does not ask either, so a headless session can
+  # create the project and then spawn into it.
+  ASSUME_YES= iw feat/one -r backend -p myproj </dev/null >/dev/null 2>&1
+  ASSUME_YES= iw feat/two -r frontend -p myproj </dev/null >/dev/null 2>&1
+  assert_link "first task linked" "$SB_TASKS/feat-one/.project"
+  assert_link "second task linked" "$SB_TASKS/feat-two/.project"
+}
+
 test_project_flag_before_repos_flag() {
   mk_repo backend
   iw feat/two -p myproj -r backend >/dev/null 2>&1

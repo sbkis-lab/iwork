@@ -234,7 +234,11 @@ iwork feat/token-api -r auth-service -p auth-rewrite
 ```
 
 The project is created on first use (after confirming), and the task folder gets a
-`.project` symlink pointing at it:
+`.project` symlink pointing at it. To create one before any task exists, say to
+start its [master](#the-master-one-agent-whose-job-is-the-project) first, use
+`iwork project new auth-rewrite`: the command is the confirmation, so it never
+prompts, and it works from a session with no terminal. It refuses a name that is
+already a project (in any case) or a task.
 
 ```
 ~/dev/projects/
