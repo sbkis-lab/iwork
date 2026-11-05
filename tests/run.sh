@@ -524,6 +524,38 @@ test_project_new_then_task_joins_without_asking() {
   assert_link "second task linked" "$SB_TASKS/feat-two/.project"
 }
 
+test_headless_intake_creates_a_project_master_and_tasks() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  # What a Remote Control session on a server has: no terminal to confirm on,
+  # no $TMUX (iw unsets it), and IWORK_DETACH from the config.
+  local brief="read notes/briefs/master.md"
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw project new myproj </dev/null >/dev/null 2>&1
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw -m "$brief" master myproj </dev/null >/dev/null 2>&1
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw feat/one -r backend -p myproj -m "brief one" </dev/null >/dev/null 2>&1
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw feat/two -r frontend -p myproj -m "brief two" </dev/null >/dev/null 2>&1
+
+  local windows
+  windows="$(windows_of_session projects-myproj)"
+  assert_contains "the master has a window" "myproj" "$windows"
+  assert_contains "the first task has a window" "feat-one" "$windows"
+  assert_contains "the second task has a window" "feat-two" "$windows"
+  assert_eq "the master is the first window" "myproj" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_index} #{window_name}' | sort -n | head -1 | cut -d' ' -f2)"
+
+  # The stub claude exits at once, so what the pane shows is the command line
+  # iwork typed into it.
+  local pane="" i=""
+  pane="$(tmux_t list-panes -t '=projects-myproj:myproj' -F '#{pane_id}' | head -1)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    tmux_t capture-pane -p -t "$pane" | grep -q 'notes/briefs' && break
+    sleep 0.2
+  done
+  assert_contains "the master was handed its brief" "notes/briefs/master.md" \
+    "$(tmux_t capture-pane -p -t "$pane")"
+}
+
 test_project_flag_before_repos_flag() {
   mk_repo backend
   iw feat/two -p myproj -r backend >/dev/null 2>&1
