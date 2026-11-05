@@ -4896,11 +4896,12 @@ append_history() {
 # 'role' is appended rather than inserted: project files written before masters
 # existed keep every field where project_agents already expects it, and their
 # rows read back as the task agents they were.
-AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript\trole'
+AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript\trole\treason'
 
 # Set from the hook payload, because the transcript path is the one field the
 # environment does not carry.
 HOOK_TRANSCRIPT=""
+HOOK_END_REASON=""
 
 # Records this session joining or leaving a project. One printf under O_APPEND,
 # for the same reason capture is: several sessions in one project come up at
@@ -4913,6 +4914,9 @@ append_agent() {
   local event="$2"
   local task="$3"
   local role="${4:-task}"
+  # Why a session ended, from the SessionEnd hook: 'prompt_input_exit' for an
+  # /exit, 'other' for a hangup. Empty on every other row.
+  local reason="${5:-}"
   local file="$PROJECTS_DIR/$project/agents.tsv"
 
   # No session id means this is not a Claude session — a bare shell running
@@ -4926,11 +4930,11 @@ append_agent() {
       { warn "could not create agents.tsv"; return 1; }
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S%z)" "$event" "$(oneline "$task")" \
     "$(oneline "$CLAUDE_CODE_SESSION_ID")" "$(oneline "${CLAUDE_PID:-}")" \
     "$(oneline "${TMUX_PANE:-}")" "$(oneline "$HOOK_TRANSCRIPT")" \
-    "$(oneline "$role")" \
+    "$(oneline "$role")" "$(oneline "$reason")" \
     >> "$file" || { warn "could not append to agents.tsv"; return 1; }
 }
 
@@ -6703,20 +6707,29 @@ resurrect_find_master() {
   printf '%s\n' "${line%% *}"
 }
 
-# Whether a project has ever had a master. agents.tsv cannot say whether the
-# last one was closed on purpose or died with the server: both end with an
-# 'ended' row, since the SessionEnd hook fires on a hangup too.
-project_had_master() {
+# Whether a project's master should come back after its window died: it has
+# had one, and the last master row is not an 'ended' whose reason says
+# someone closed it (/exit, logout). A hangup ends a session too, with reason
+# 'other'; rows written before reasons were recorded have none, and count as a
+# hangup, since that is what a dead server leaves behind.
+project_master_wanted() {
   local file="$PROJECTS_DIR/$1/agents.tsv"
 
   [[ -f "$file" ]] || return 1
-  awk -F'\t' '$8 == "master" { found = 1 } END { exit !found }' "$file"
+  awk -F'\t' '
+    /^#/ { next }
+    $8 == "master" { seen = 1; event = $2; reason = $9 }
+    END {
+      if (!seen) exit 1
+      if (event == "ended" && (reason == "prompt_input_exit" || reason == "logout")) exit 1
+      exit 0
+    }' "$file"
 }
 
 # A dead server takes every master window with it, and resurrect used to bring
 # back only masters whose window had survived, i.e. none, after the one event
-# it exists for. A project that has had a master and still has tasks gets its
-# master back, on its last conversation; one whose work is done does not.
+# it exists for. A project whose master died rather than being closed, and
+# that still has tasks, gets its master back on its last conversation.
 resurrect_reopen_master() {
   local project="$1"
   local cmd=()
@@ -6748,7 +6761,7 @@ resurrect_projects() {
     if window_id="$(resurrect_find_master "$project")"; then
       pane="$(window_agent_pane "$window_id")"
       [[ -z "$pane" ]] || resurrect_start_agent "$pane" "master of '$project'"
-    elif project_had_master "$project" && [[ -n "$(project_tasks_live "$project")" ]]; then
+    elif project_master_wanted "$project" && [[ -n "$(project_tasks_live "$project")" ]]; then
       resurrect_reopen_master "$project" || true
     else
       echo "  project '$project' has no master; start one with: iwork master $project"
@@ -7049,7 +7062,7 @@ hook_session_start() {
 hook_session_end() {
   hook_project_context || return 0
 
-  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" "$HOOK_ROLE" 2>/dev/null || true
+  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" "$HOOK_ROLE" "$HOOK_END_REASON" 2>/dev/null || true
 }
 
 # Fires exactly when the reasoning is about to be dropped, which is the one
@@ -7191,6 +7204,12 @@ handle_claude_hook() {
   # so the hook still needs no JSON parser.
   HOOK_TRANSCRIPT="$(printf '%s' "$input" |
     sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -1 || true)"
+
+  # SessionEnd only: why the session ended, which is what lets resurrect tell
+  # a master closed with /exit from one that died with the tmux server.
+  HOOK_END_REASON="$(printf '%s' "$input" |
+    sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
     head -1 || true)"
 
   case "$event" in

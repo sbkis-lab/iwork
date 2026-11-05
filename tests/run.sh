@@ -3216,20 +3216,29 @@ test_resurrect_brings_masters_back_after_the_server_died() {
   command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
   mk_repo backend
   mk_repo frontend
-  # alpha: had a master, has tasks. beta: tasks, never a master.
-  # gamma: had a master, no tasks left.
+  # alpha: master died with the server (old row, no reason), has tasks.
+  # beta: tasks, never a master. gamma: master died, no tasks left.
+  # delta: tasks, master died once, then a later one was closed with /exit.
+  # epsilon: tasks, master hung up (reason 'other').
   WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
   WANT_TMUX=1 iw --detach feat/two -r frontend -p alpha >/dev/null 2>&1
   WANT_TMUX=1 iw --detach feat/three -r backend -p beta >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/four -r backend -p delta >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/five -r frontend -p epsilon >/dev/null 2>&1
   iw project new gamma >/dev/null 2>&1
   WANT_TMUX=1 iw --detach master alpha >/dev/null 2>&1
   local p=""
-  for p in alpha gamma; do
+  for p in alpha gamma delta epsilon; do
     printf '2026-11-05T19:00:00+0000\tregistered\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\n' "$p" \
       >> "$SB_PROJECTS/$p/agents.tsv"
+  done
+  for p in alpha gamma delta; do
     printf '2026-11-05T19:48:44+0000\tended\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\n' "$p" \
       >> "$SB_PROJECTS/$p/agents.tsv"
   done
+  printf '2026-11-05T20:00:00+0000\tregistered\t\tsess-d2\t1\t%%1\t/x.jsonl\tmaster\t\n' >> "$SB_PROJECTS/delta/agents.tsv"
+  printf '2026-11-05T20:10:00+0000\tended\t\tsess-d2\t1\t%%1\t/x.jsonl\tmaster\tprompt_input_exit\n' >> "$SB_PROJECTS/delta/agents.tsv"
+  printf '2026-11-05T20:10:00+0000\tended\t\tsess-epsilon\t1\t%%1\t/x.jsonl\tmaster\tother\n' >> "$SB_PROJECTS/epsilon/agents.tsv"
 
   # The server dies and takes every window with it. tmux_t clears $TMUX, so
   # this is the sandbox's server and nobody else's.
@@ -3260,10 +3269,37 @@ test_resurrect_brings_masters_back_after_the_server_died() {
   esac
   assert_contains "beta is told how to start one" "project 'beta' has no master" "$out"
   assert_eq "a project with no tasks left gets no master" "" "$(windows_of_session projects-gamma)"
+  case "$(windows_of_session projects-delta)" in
+    *delta*) bad "a master closed with /exit came back" ;;
+    *) ok ;;
+  esac
+  assert_contains "a master that hung up comes back" "master of 'epsilon': opened" "$out"
 
   out="$(WANT_TMUX=1 iw resurrect 2>&1)"
   assert_eq "a second resurrect makes no second master" "1" \
     "$(tmux_t list-windows -t '=projects-alpha' -F '#{window_name}' 2>/dev/null | grep -cx alpha | tr -d ' ')"
+}
+
+test_session_end_records_why_it_ended() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-r1" WANT_CLAUDE_PID="$$" WANT_PANE="%7"
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}' >/dev/null
+  WANT_SESSION_ID="sess-r2"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionEnd","reason":"other"}' >/dev/null
+  unset WANT_SESSION_ID WANT_CLAUDE_PID WANT_PANE
+
+  local f="$SB_PROJECTS/myproj/agents.tsv"
+  assert_eq "a master's /exit is recorded" "master prompt_input_exit" \
+    "$(awk -F'\t' '$4 == "sess-r1" && $2 == "ended" { print $8, $9 }' "$f")"
+  assert_eq "a task's hangup is recorded" "task other" \
+    "$(awk -F'\t' '$4 == "sess-r2" && $2 == "ended" { print $8, $9 }' "$f")"
+  assert_eq "a registration carries no reason" "" \
+    "$(awk -F'\t' '$4 == "sess-r1" && $2 == "registered" { print $9 }' "$f" | head -1)"
+  # The extra column must not disturb who is live: both are ended.
+  assert_contains "neither is listed as live" "(none)" "$(iw project agents myproj 2>&1)"
 }
 
 test_resurrect_dry_run_names_the_master_it_would_reopen() {
