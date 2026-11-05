@@ -35,7 +35,7 @@ assert_sandboxed() {
     *) echo "fatal: sandbox '$SB' is not under $TMP_BASE" >&2; exit 1 ;;
   esac
   local dir=""
-  for dir in "$SB_REPOS" "$SB_TASKS" "$SB_PROJECTS" "$SB_HOME"; do
+  for dir in "$SB_REPOS" "$SB_TASKS" "$SB_PROJECTS" "$SB_HOME" "$SB_SOCK"; do
     case "$dir" in
       "$SB"/*) ;;
       *) echo "fatal: '$dir' escapes the sandbox" >&2; exit 1 ;;
@@ -50,6 +50,12 @@ setup_sandbox() {
   SB_PROJECTS="$SB/projects"
   SB_HOME="$SB/home"
   SB_ORIGINS="$SB/origins"
+  # The sandbox's tmux socket, named outright. tmux prefers the socket in $TMUX
+  # over TMUX_TMPDIR, so a kill-server that relied on TMUX_TMPDIR alone, run
+  # from inside tmux, once killed the real server and every agent in it
+  # (2026-11-05). The suite's own tmux calls pass -S this and unset $TMUX; iwork
+  # under test resolves the same path from TMUX_TMPDIR with $TMUX unset.
+  SB_SOCK="$SB/tmux/tmux-$(id -u)/default"
   assert_sandboxed
 
   mkdir -p "$SB_REPOS" "$SB_TASKS" "$SB_PROJECTS" "$SB_HOME/.config/iwork" \
@@ -76,7 +82,8 @@ CONF
   # suite's stdout, so anything reading our output (a pipe to tail, a CI
   # collector) would block until teardown even though the run had finished.
   if command -v tmux >/dev/null 2>&1; then
-    env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null start-server \
+    mkdir -p "${SB_SOCK%/*}" && chmod 700 "${SB_SOCK%/*}"
+    env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -S "$SB_SOCK" -f /dev/null start-server \
       </dev/null >/dev/null 2>&1 || true
   fi
 
@@ -170,7 +177,7 @@ iw_in() {
   ( cd "$dir" && iw "$@" )
 }
 
-tmux_t() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null "$@"; }
+tmux_t() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -S "$SB_SOCK" -f /dev/null "$@"; }
 
 # send-keys returns once the keys are in the pane's input buffer, not once the
 # command has started, so a test that reads pane state straight afterwards races
@@ -199,7 +206,7 @@ wait_for_pane_command() {
 
   return 1
 }
-tmux_kill_server() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux kill-server 2>/dev/null; return 0; }
+tmux_kill_server() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -S "$SB_SOCK" kill-server 2>/dev/null; return 0; }
 
 # --- assertions ---------------------------------------------------------------
 
@@ -3162,6 +3169,47 @@ test_resurrect_keeps_a_master_window() {
   WANT_TMUX=1 iw resurrect >/dev/null 2>&1
   assert_contains "the master window survives the sweep" "myproj" \
     "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
+}
+
+# The incident this guards against: a kill-server meant for a test server, run
+# from inside tmux with only TMUX_TMPDIR set, killed the real one. A decoy
+# server stands in for it, named by $TMUX the way a real pane's shell has it.
+test_harness_never_reaches_the_server_in_TMUX() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local decoy="$SB/decoy/sock"
+  mkdir -p "$SB/decoy" && chmod 700 "$SB/decoy"
+  env -u TMUX tmux -S "$decoy" -f /dev/null new-session -d -s real-work </dev/null >/dev/null 2>&1 || {
+    printf '    skip (could not start a decoy server)\n'; return 0; }
+  local pid=""
+  pid="$(env -u TMUX tmux -S "$decoy" display -p '#{pid}')"
+  mk_repo backend
+
+  (
+    export TMUX="$decoy,$pid,0"
+    # Everything the suite does to tmux: iwork through iw, and its own helpers.
+    WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+    WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+    tmux_t kill-session -t '=projects-myproj' >/dev/null 2>&1
+    tmux_t kill-server >/dev/null 2>&1
+    tmux_kill_server
+  )
+
+  assert_ok "the server in \$TMUX survived the harness" env -u TMUX tmux -S "$decoy" has-session -t '=real-work'
+
+  # And the decoy is a fair stand-in: the unsafe form does reach it.
+  ( export TMUX="$decoy,$pid,0" TMUX_TMPDIR="$SB/tmux"; tmux kill-server >/dev/null 2>&1 ) # unsafe on purpose: the decoy
+  assert_fails "TMUX_TMPDIR alone would have killed it" env -u TMUX tmux -S "$decoy" has-session -t '=real-work'
+  env -u TMUX tmux -S "$decoy" kill-server >/dev/null 2>&1 || true
+}
+
+# Static half of the same guard: every kill in this file goes through the
+# pinned helpers or names its socket, so a new test can't bring the unsafe form
+# back without failing here.
+test_every_tmux_kill_in_the_suite_names_its_socket() {
+  local offenders=""
+  offenders="$(grep -nE '(^|[^_[:alnum:]])tmux[^_]*kill-(server|session)' "$TESTS_DIR/run.sh" |
+    grep -v '^[0-9]*:[[:space:]]*#' | grep -vE -- '-S "|-L |# unsafe on purpose: the decoy$' || true)"
+  assert_eq "no tmux kill without -S/-L" "" "$offenders"
 }
 
 test_resurrect_brings_masters_back_after_the_server_died() {
