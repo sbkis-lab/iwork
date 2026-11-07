@@ -35,7 +35,7 @@ assert_sandboxed() {
     *) echo "fatal: sandbox '$SB' is not under $TMP_BASE" >&2; exit 1 ;;
   esac
   local dir=""
-  for dir in "$SB_REPOS" "$SB_TASKS" "$SB_PROJECTS" "$SB_HOME"; do
+  for dir in "$SB_REPOS" "$SB_TASKS" "$SB_PROJECTS" "$SB_HOME" "$SB_SOCK"; do
     case "$dir" in
       "$SB"/*) ;;
       *) echo "fatal: '$dir' escapes the sandbox" >&2; exit 1 ;;
@@ -50,6 +50,12 @@ setup_sandbox() {
   SB_PROJECTS="$SB/projects"
   SB_HOME="$SB/home"
   SB_ORIGINS="$SB/origins"
+  # The sandbox's tmux socket, named outright. tmux prefers the socket in $TMUX
+  # over TMUX_TMPDIR, so a kill-server that relied on TMUX_TMPDIR alone, run
+  # from inside tmux, once killed the real server and every agent in it
+  # (2026-11-05). The suite's own tmux calls pass -S this and unset $TMUX; iwork
+  # under test resolves the same path from TMUX_TMPDIR with $TMUX unset.
+  SB_SOCK="$SB/tmux/tmux-$(id -u)/default"
   assert_sandboxed
 
   mkdir -p "$SB_REPOS" "$SB_TASKS" "$SB_PROJECTS" "$SB_HOME/.config/iwork" \
@@ -76,7 +82,8 @@ CONF
   # suite's stdout, so anything reading our output (a pipe to tail, a CI
   # collector) would block until teardown even though the run had finished.
   if command -v tmux >/dev/null 2>&1; then
-    env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null start-server \
+    mkdir -p "${SB_SOCK%/*}" && chmod 700 "${SB_SOCK%/*}"
+    env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -S "$SB_SOCK" -f /dev/null start-server \
       </dev/null >/dev/null 2>&1 || true
   fi
 
@@ -171,7 +178,7 @@ iw_in() {
   ( cd "$dir" && iw "$@" )
 }
 
-tmux_t() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -f /dev/null "$@"; }
+tmux_t() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -S "$SB_SOCK" -f /dev/null "$@"; }
 
 # send-keys returns once the keys are in the pane's input buffer, not once the
 # command has started, so a test that reads pane state straight afterwards races
@@ -200,7 +207,7 @@ wait_for_pane_command() {
 
   return 1
 }
-tmux_kill_server() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux kill-server 2>/dev/null; return 0; }
+tmux_kill_server() { env -u TMUX TMUX_TMPDIR="$SB/tmux" tmux -S "$SB_SOCK" kill-server 2>/dev/null; return 0; }
 
 # --- assertions ---------------------------------------------------------------
 
@@ -473,6 +480,88 @@ test_project_created_on_first_use() {
   assert_dir "notes/ seeded" "$SB_PROJECTS/myproj/notes"
   assert_grep "opened event recorded" "opened" "$SB_PROJECTS/myproj/history.tsv"
   assert_grep "opened event names the task" "feat-one" "$SB_PROJECTS/myproj/history.tsv"
+}
+
+test_project_new_creates_without_asking() {
+  # ASSUME_YES= makes confirm() die for want of a terminal, which is what a
+  # Remote Control or systemd session sees; 'project new' must not ask at all.
+  ASSUME_YES= iw project new alpha </dev/null >/dev/null 2>&1
+  ASSUME_YES= iw project new beta </dev/null >/dev/null 2>&1
+
+  assert_file "alpha PROJECT.md seeded" "$SB_PROJECTS/alpha/PROJECT.md"
+  assert_file "alpha LOG.md seeded" "$SB_PROJECTS/alpha/LOG.md"
+  assert_dir "alpha notes/ seeded" "$SB_PROJECTS/alpha/notes"
+  assert_file "beta PROJECT.md seeded" "$SB_PROJECTS/beta/PROJECT.md"
+  local out
+  out="$(iw project list 2>&1)"
+  assert_contains "alpha listed" "alpha" "$out"
+  assert_contains "beta listed" "beta" "$out"
+}
+
+test_project_new_refuses_an_existing_project() {
+  iw project new alpha >/dev/null 2>&1
+  printf 'hand-written goal\n' >> "$SB_PROJECTS/alpha/PROJECT.md"
+
+  assert_fails "same name refused" iw project new alpha
+  assert_fails "same name in another case refused" iw project new ALPHA
+  # By listing, not by path: on a case-insensitive filesystem ALPHA "exists".
+  assert_eq "no case twin created" "alpha" "$(ls "$SB_PROJECTS")"
+  assert_grep "existing PROJECT.md untouched" "hand-written goal" "$SB_PROJECTS/alpha/PROJECT.md"
+}
+
+test_project_new_refuses_bad_names_and_tasks() {
+  mk_repo backend
+  iw feat/clash -r backend >/dev/null 2>&1
+  assert_fails "named after a task" iw project new feat-clash
+  assert_fails "slash refused" iw project new 'a/b'
+  assert_fails "marker prefix refused" iw project new '*bad'
+  assert_fails "no name" iw project new
+  assert_fails "two names" iw project new one two
+  assert_no_file "nothing called one" "$SB_PROJECTS/one"
+}
+
+test_project_new_then_task_joins_without_asking() {
+  mk_repo backend
+  mk_repo frontend
+  ASSUME_YES= iw project new myproj </dev/null >/dev/null 2>&1
+  # -p on an existing project does not ask either, so a headless session can
+  # create the project and then spawn into it.
+  ASSUME_YES= iw feat/one -r backend -p myproj </dev/null >/dev/null 2>&1
+  ASSUME_YES= iw feat/two -r frontend -p myproj </dev/null >/dev/null 2>&1
+  assert_link "first task linked" "$SB_TASKS/feat-one/.project"
+  assert_link "second task linked" "$SB_TASKS/feat-two/.project"
+}
+
+test_headless_intake_creates_a_project_master_and_tasks() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  # What a Remote Control session on a server has: no terminal to confirm on,
+  # no $TMUX (iw unsets it), and IWORK_DETACH from the config.
+  local brief="read notes/briefs/master.md"
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw project new myproj </dev/null >/dev/null 2>&1
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw -m "$brief" master myproj </dev/null >/dev/null 2>&1
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw feat/one -r backend -p myproj -m "brief one" </dev/null >/dev/null 2>&1
+  ASSUME_YES= IWORK_DETACH=1 WANT_TMUX=1 iw feat/two -r frontend -p myproj -m "brief two" </dev/null >/dev/null 2>&1
+
+  local windows
+  windows="$(windows_of_session projects-myproj)"
+  assert_contains "the master has a window" "myproj" "$windows"
+  assert_contains "the first task has a window" "feat-one" "$windows"
+  assert_contains "the second task has a window" "feat-two" "$windows"
+  assert_eq "the master is the first window" "myproj" \
+    "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_index} #{window_name}' | sort -n | head -1 | cut -d' ' -f2)"
+
+  # The stub claude exits at once, so what the pane shows is the command line
+  # iwork typed into it.
+  local pane="" i=""
+  pane="$(tmux_t list-panes -t '=projects-myproj:myproj' -F '#{pane_id}' | head -1)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    tmux_t capture-pane -p -t "$pane" | grep -q 'notes/briefs' && break
+    sleep 0.2
+  done
+  assert_contains "the master was handed its brief" "notes/briefs/master.md" \
+    "$(tmux_t capture-pane -p -t "$pane")"
 }
 
 test_project_flag_before_repos_flag() {
@@ -3083,6 +3172,153 @@ test_resurrect_keeps_a_master_window() {
     "$(tmux_t list-windows -t '=projects-myproj' -F '#{window_name}' 2>/dev/null | tr '\n' ' ')"
 }
 
+# The incident this guards against: a kill-server meant for a test server, run
+# from inside tmux with only TMUX_TMPDIR set, killed the real one. A decoy
+# server stands in for it, named by $TMUX the way a real pane's shell has it.
+test_harness_never_reaches_the_server_in_TMUX() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local decoy="$SB/decoy/sock"
+  mkdir -p "$SB/decoy" && chmod 700 "$SB/decoy"
+  env -u TMUX tmux -S "$decoy" -f /dev/null new-session -d -s real-work </dev/null >/dev/null 2>&1 || {
+    printf '    skip (could not start a decoy server)\n'; return 0; }
+  local pid=""
+  pid="$(env -u TMUX tmux -S "$decoy" display -p '#{pid}')"
+  mk_repo backend
+
+  (
+    export TMUX="$decoy,$pid,0"
+    # Everything the suite does to tmux: iwork through iw, and its own helpers.
+    WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+    WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+    tmux_t kill-session -t '=projects-myproj' >/dev/null 2>&1
+    tmux_t kill-server >/dev/null 2>&1
+    tmux_kill_server
+  )
+
+  assert_ok "the server in \$TMUX survived the harness" env -u TMUX tmux -S "$decoy" has-session -t '=real-work'
+
+  # And the decoy is a fair stand-in: the unsafe form does reach it.
+  ( export TMUX="$decoy,$pid,0" TMUX_TMPDIR="$SB/tmux"; tmux kill-server >/dev/null 2>&1 ) # unsafe on purpose: the decoy
+  assert_fails "TMUX_TMPDIR alone would have killed it" env -u TMUX tmux -S "$decoy" has-session -t '=real-work'
+  env -u TMUX tmux -S "$decoy" kill-server >/dev/null 2>&1 || true
+}
+
+# Static half of the same guard: every kill in this file goes through the
+# pinned helpers or names its socket, so a new test can't bring the unsafe form
+# back without failing here.
+test_every_tmux_kill_in_the_suite_names_its_socket() {
+  local offenders=""
+  offenders="$(grep -nE '(^|[^_[:alnum:]])tmux[^_]*kill-(server|session)' "$TESTS_DIR/run.sh" |
+    grep -v '^[0-9]*:[[:space:]]*#' | grep -vE -- '-S "|-L |# unsafe on purpose: the decoy$' || true)"
+  assert_eq "no tmux kill without -S/-L" "" "$offenders"
+}
+
+test_resurrect_brings_masters_back_after_the_server_died() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  # alpha: master died with the server (old row, no reason), has tasks.
+  # beta: tasks, never a master. gamma: master died, no tasks left.
+  # delta: tasks, master died once, then a later one was closed with /exit.
+  # epsilon: tasks, master hung up (reason 'other').
+  WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r frontend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/three -r backend -p beta >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/four -r backend -p delta >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/five -r frontend -p epsilon >/dev/null 2>&1
+  iw project new gamma >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach master alpha >/dev/null 2>&1
+  local p=""
+  for p in alpha gamma delta epsilon; do
+    printf '2026-11-05T19:00:00+0000\tregistered\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\n' "$p" \
+      >> "$SB_PROJECTS/$p/agents.tsv"
+  done
+  for p in alpha gamma delta; do
+    printf '2026-11-05T19:48:44+0000\tended\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\n' "$p" \
+      >> "$SB_PROJECTS/$p/agents.tsv"
+  done
+  printf '2026-11-05T20:00:00+0000\tregistered\t\tsess-d2\t1\t%%1\t/x.jsonl\tmaster\t\n' >> "$SB_PROJECTS/delta/agents.tsv"
+  printf '2026-11-05T20:10:00+0000\tended\t\tsess-d2\t1\t%%1\t/x.jsonl\tmaster\tprompt_input_exit\n' >> "$SB_PROJECTS/delta/agents.tsv"
+  printf '2026-11-05T20:10:00+0000\tended\t\tsess-epsilon\t1\t%%1\t/x.jsonl\tmaster\tother\n' >> "$SB_PROJECTS/epsilon/agents.tsv"
+
+  # The server dies and takes every window with it. tmux_t clears $TMUX, so
+  # this is the sandbox's server and nobody else's.
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+
+  assert_contains "alpha's master is reported back" "master of 'alpha': opened" "$out"
+  assert_eq "alpha's master is the first window again" "alpha" \
+    "$(tmux_t list-windows -t '=projects-alpha' -F '#{window_index} #{window_name}' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2)"
+  assert_contains "alpha's tasks are back too" "feat-two" "$(windows_of_session projects-alpha)"
+
+  local pane="" i=""
+  pane="$(tmux_t list-panes -t '=projects-alpha:alpha' -F '#{pane_id}' 2>/dev/null | head -1)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    tmux_t capture-pane -p -t "$pane" 2>/dev/null | tr -d ' \n' | grep -q 'claude--continue' && break
+    sleep 0.2
+  done
+  # Squeezed: the shell wraps the line in a narrow pane wherever it likes.
+  assert_contains "on its last conversation" "claude--continue" \
+    "$(tmux_t capture-pane -p -t "$pane" 2>/dev/null | tr -d ' \n')"
+
+  case "$(windows_of_session projects-beta)" in
+    *beta*) bad "a project that never had a master got one" ;;
+    *) ok ;;
+  esac
+  assert_contains "beta is told how to start one" "project 'beta' has no master" "$out"
+  assert_eq "a project with no tasks left gets no master" "" "$(windows_of_session projects-gamma)"
+  case "$(windows_of_session projects-delta)" in
+    *delta*) bad "a master closed with /exit came back" ;;
+    *) ok ;;
+  esac
+  assert_contains "a master that hung up comes back" "master of 'epsilon': opened" "$out"
+
+  out="$(WANT_TMUX=1 iw resurrect 2>&1)"
+  assert_eq "a second resurrect makes no second master" "1" \
+    "$(tmux_t list-windows -t '=projects-alpha' -F '#{window_name}' 2>/dev/null | grep -cx alpha | tr -d ' ')"
+}
+
+test_session_end_records_why_it_ended() {
+  mk_repo backend
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  local WANT_SESSION_ID="sess-r1" WANT_CLAUDE_PID="$$" WANT_PANE="%7"
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_PROJECTS/myproj" '{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}' >/dev/null
+  WANT_SESSION_ID="sess-r2"
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionStart"}' >/dev/null
+  hook_fire "$SB_TASKS/feat-one" '{"hook_event_name":"SessionEnd","reason":"other"}' >/dev/null
+  unset WANT_SESSION_ID WANT_CLAUDE_PID WANT_PANE
+
+  local f="$SB_PROJECTS/myproj/agents.tsv"
+  assert_eq "a master's /exit is recorded" "master prompt_input_exit" \
+    "$(awk -F'\t' '$4 == "sess-r1" && $2 == "ended" { print $8, $9 }' "$f")"
+  assert_eq "a task's hangup is recorded" "task other" \
+    "$(awk -F'\t' '$4 == "sess-r2" && $2 == "ended" { print $8, $9 }' "$f")"
+  assert_eq "a registration carries no reason" "" \
+    "$(awk -F'\t' '$4 == "sess-r1" && $2 == "registered" { print $9 }' "$f" | head -1)"
+  # The extra column must not disturb who is live: both are ended.
+  assert_contains "neither is listed as live" "(none)" "$(iw project agents myproj 2>&1)"
+}
+
+test_resurrect_dry_run_names_the_master_it_would_reopen() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r frontend -p alpha >/dev/null 2>&1
+  printf '2026-11-05T19:00:00+0000\tregistered\t\tsess-a\t1\t%%1\t/x.jsonl\tmaster\n' >> "$SB_PROJECTS/alpha/agents.tsv"
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 iw resurrect -n 2>&1)"
+  assert_contains "dry run names it" "master of 'alpha': would open" "$out"
+  assert_eq "and opens nothing" "" "$(windows_of_session projects-alpha)"
+}
+
 # The default claude stub throws its arguments away, and what these are about is
 # exactly the arguments: which sessions get Remote Control and under what name.
 recording_claude() {
@@ -3253,6 +3489,48 @@ test_master_remote_control_value_is_not_case_sensitive() {
   iw feat/one -r backend -p myproj >/dev/null 2>&1
   WANT_MASTER_RC=ON iw master myproj >/dev/null 2>&1
   assert_contains "ON is on" "--remote-control myproj (master)" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
+# A master reopened after the server died is the one restart nobody watches:
+# it must come back on the phone too (IWORK_MASTER_REMOTE_CONTROL).
+test_resurrect_reopened_master_keeps_remote_control() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  recording_claude
+  WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r frontend -p beta >/dev/null 2>&1
+  local p=""
+  for p in alpha beta; do
+    printf '2026-11-07T10:00:00+0000\tregistered\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\t\n' "$p" >> "$SB_PROJECTS/$p/agents.tsv"
+    printf '2026-11-07T10:05:00+0000\tended\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\tother\n' "$p" >> "$SB_PROJECTS/$p/agents.tsv"
+  done
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+  : > "$SB/claude-argv"
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on iw resurrect 2>&1)"
+  assert_contains "the report shows the flag" "master of 'alpha': opened its window running 'claude --continue --remote-control alpha\ \(master\)'" "$out"
+  local i=""
+  for i in $(seq 50); do
+    [ "$(grep -c -- '--remote-control' "$SB/claude-argv" 2>/dev/null)" -ge 2 ] && break
+    sleep 0.1
+  done
+  assert_grep "alpha's master is back on Remote Control" "^--continue --remote-control alpha (master)$" "$SB/claude-argv"
+  assert_grep "and beta's" "^--continue --remote-control beta (master)$" "$SB/claude-argv"
+
+  # Off: the same reopen without the flag.
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+  : > "$SB/claude-argv"
+  WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+  for i in $(seq 50); do
+    [ "$(grep -c -- '--continue' "$SB/claude-argv" 2>/dev/null)" -ge 4 ] && break
+    sleep 0.1
+  done
+  assert_no_grep "no flag when it is off" "remote-control" "$SB/claude-argv"
+  assert_grep "but still on its last conversation" "^--continue$" "$SB/claude-argv"
 }
 
 test_resurrect_gathers_a_projects_task_back_into_its_session() {
