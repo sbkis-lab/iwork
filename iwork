@@ -3931,6 +3931,7 @@ refresh_task_blocks() {
 # one has landed. Non-zero means nothing moved. --first puts it before every
 # other window in the target, which is where a master belongs.
 move_window_to_session() {
+  pane_env_init
   local first=""
 
   if [[ "${1:-}" == "--first" ]]; then
@@ -3946,10 +3947,11 @@ move_window_to_session() {
   local placeholder=""
 
   if ! target="$(resolve_session_name "$base")"; then
-    if ! placeholder="$(tmux new-session -d -s "$base" -c "$TASKS_DIR" -P -F '#{window_id}' 2>/dev/null)"; then
+    if ! placeholder="$(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$base" -c "$TASKS_DIR" -P -F '#{window_id}' 2>/dev/null)"; then
       warn "could not create tmux session '$base' for '$window_name'"
       return 1
     fi
+    clear_session_env "$placeholder"
 
     merge_duplicate_sessions "$base"
     target="$(resolve_session_name "$base" || printf '%s' "$base")"
@@ -5457,12 +5459,57 @@ project_grep() {
   fi
 }
 
+# Environment for the panes iwork creates, most of which it then types a
+# command into. oh-my-zsh asks "Would you like to update? [Y/n]" at shell start,
+# and that question reads one key: the first byte of the command iwork types, so
+# 'claude' runs as 'laude'. These turn the check off. oh-my-zsh honours them only
+# when ~/.zshrc sets no zstyle ':omz:update' mode and does not assign them
+# itself; a zstyle set to prompt still asks, and wins.
+#
+# 'tmux -e' came to new-window and split-window in 3.0 and to new-session in
+# 3.2; older tmux, or a version string that does not parse, gets nothing rather
+# than a window that fails to open. (tmux -V is the client's version; a server
+# left running from before an upgrade could still be older.)
+PANE_ENV=()
+SESSION_ENV=()
+pane_env_init() {
+  local version=""
+  local major=""
+  local minor=""
+
+  [[ -z "${PANE_ENV_DONE:-}" ]] || return 0
+  PANE_ENV_DONE=1
+  # Two steps: a missing tmux fails the pipeline, which pipefail and set -e
+  # would turn into iwork exiting.
+  version="$(tmux -V 2>/dev/null || true)"
+  [[ "$version" =~ ^tmux\ ([0-9]+)\.([0-9]+) ]] || return 0
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+
+  (( major >= 3 )) || return 0
+  PANE_ENV=(-e DISABLE_AUTO_UPDATE=true -e DISABLE_UPDATE_PROMPT=true)
+  (( major > 3 || minor >= 2 )) || return 0
+  SESSION_ENV=("${PANE_ENV[@]}")
+}
+
+# new-session -e also writes the variables into the session's environment, so
+# every later shell in it would skip oh-my-zsh's updates for good, the
+# operator's own windows included. The first pane already has them, and iwork
+# hands PANE_ENV to every window it adds, so take them back out. $1 is any
+# target in the session, such as the window just made.
+clear_session_env() {
+  (( ${#SESSION_ENV[@]} )) || return 0
+  tmux set-environment -t "$1" -u DISABLE_AUTO_UPDATE \; \
+    set-environment -t "$1" -u DISABLE_UPDATE_PROMPT 2>/dev/null || true
+}
+
 # The window an agent runs in: the tool on the left, a shell on the right, both
 # rooted at $dir, creating $session if it is not there yet. Prints the window id.
 #
 # Finding an existing window is the caller's job, not this function's: a task can
 # be in either of two sessions while a master is only ever in one.
 spawn_agent_window() {
+  pane_env_init
   local first=""
 
   # --first puts the window before every other one in the session, which is
@@ -5495,21 +5542,22 @@ spawn_agent_window() {
     [[ -z "$first" ]] || target="=$live:^"
     # -d keeps the new window from becoming the session's active window, which
     # would move the client if it is already viewing that session.
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${IWORK_DETACH:+-d} ${first:+-b} -t "$target" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} ${IWORK_DETACH:+-d} ${first:+-b} -t "$target" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux window '$name'"
       return 1
     fi
   else
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$session" -n "$name" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux session '$session'"
       return 1
     fi
+    clear_session_env "$window_id"
 
     # A marked twin may have appeared while we were deciding there was none.
     merge_duplicate_sessions "$session"
   fi
 
-  tmux split-window -h -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$name'"
+  tmux split-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} -h -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$name'"
   tmux select-pane -t "$pane_id" 2>/dev/null || true
 
   printf -v tool_cmd '%q ' "$tool" "$@"
@@ -5629,6 +5677,7 @@ open_master_window() {
 # One window per repo worktree: editor on the left, shell on the right, both
 # rooted in the worktree. Idempotent, so add-repo can extend a live session.
 add_repo_windows() {
+  pane_env_init
   local folder="$1"
   local session="$2"
   local folder_path="$TASKS_DIR/$folder"
@@ -5643,12 +5692,12 @@ add_repo_windows() {
 
     find_window_in_session "$session" "$name" >/dev/null && continue
 
-    if ! pane_id="$(tmux new-window -d -t "=$session" -n "$name" -c "$wt" -P -F '#{pane_id}' 2>/dev/null)"; then
+    if ! pane_id="$(tmux new-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} -d -t "=$session" -n "$name" -c "$wt" -P -F '#{pane_id}' 2>/dev/null)"; then
       warn "could not create tmux window '$name'"
       continue
     fi
 
-    tmux split-window -h -t "$pane_id" -c "$wt" 2>/dev/null || warn "could not split tmux window '$name'"
+    tmux split-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} -h -t "$pane_id" -c "$wt" 2>/dev/null || warn "could not split tmux window '$name'"
     tmux select-pane -t "$pane_id" 2>/dev/null || true
     # IWORK_EDITOR is a command line from the user's own config, so run it as
     # written with the worktree appended.
@@ -5661,6 +5710,7 @@ add_repo_windows() {
 }
 
 open_task_session() {
+  pane_env_init
   local folder="$1"
   local tool="$2"
   shift 2
@@ -5703,10 +5753,11 @@ open_task_session() {
 
     # The agent window keeps the task name so the Claude status hooks still
     # recognise it (*task busy, !task waiting).
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$session" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$session" -n "$folder" -c "$folder_path" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux session '$session'"
       return 0
     fi
+    clear_session_env "$window_id"
     created=1
 
     # Folding into a twin leaves the name we just used pointing at nothing, so
@@ -5714,7 +5765,7 @@ open_task_session() {
     merge_duplicate_sessions "$base_session"
     session="$(resolve_session_name "$base_session" || printf '%s' "$base_session")"
 
-    tmux split-window -h -t "$pane_id" -c "$folder_path" 2>/dev/null || warn "could not split tmux window '$folder'"
+    tmux split-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} -h -t "$pane_id" -c "$folder_path" 2>/dev/null || warn "could not split tmux window '$folder'"
     tmux select-pane -t "$pane_id" 2>/dev/null || true
 
     printf -v tool_cmd '%q ' "$tool" "$@"
@@ -6228,6 +6279,7 @@ require_repos_session_name() {
 # Tagged with '@iwork_repo' so it is still recognised after a rename, or with
 # an agent's marker on its name.
 open_repo_window() {
+  pane_env_init
   local repo="$1"
   local dir="$REPO_DIR/$repo"
   local live=""
@@ -6235,19 +6287,20 @@ open_repo_window() {
   local pane_id=""
 
   if live="$(resolve_session_name "$REPOS_SESSION")"; then
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window -d -t "=$live" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} -d -t "=$live" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux window '$repo'"
       return 1
     fi
   else
-    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session -d -s "$REPOS_SESSION" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
+    if ! IFS=' ' read -r window_id pane_id < <(tmux new-session ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} -d -s "$REPOS_SESSION" -n "$repo" -c "$dir" -P -F '#{window_id} #{pane_id}' 2>/dev/null); then
       warn "could not create tmux session '$REPOS_SESSION'"
       return 1
     fi
+    clear_session_env "$window_id"
   fi
 
   tmux set-option -w -t "$window_id" @iwork_repo "$repo" 2>/dev/null || true
-  tmux split-window -h -d -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$repo'"
+  tmux split-window ${PANE_ENV[@]+"${PANE_ENV[@]}"} -h -d -t "$pane_id" -c "$dir" 2>/dev/null || warn "could not split tmux window '$repo'"
 }
 
 # Syncs run from a tmux hook in the background, so two session switches in a
