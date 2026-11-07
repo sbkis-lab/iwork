@@ -166,6 +166,7 @@ iw() {
   [[ -n "${WANT_GROUP_RENT_STACK:-}" ]] && env_args+=(IWORK_REPO_GROUP_RENT_STACK="$WANT_GROUP_RENT_STACK")
   [[ -n "${WANT_AGENT:-}" ]] && env_args+=(IWORK_AGENT="$WANT_AGENT")
   [[ -n "${WANT_AGENT_ARGS_CODEX:-}" ]] && env_args+=(IWORK_AGENT_ARGS_CODEX="$WANT_AGENT_ARGS_CODEX")
+  [[ -n "${WANT_MASTER_RC:-}" ]] && env_args+=(IWORK_MASTER_REMOTE_CONTROL="$WANT_MASTER_RC")
 
   env -u TMUX "${env_args[@]}" "$IWORK_SRC" "$@"
 }
@@ -3316,6 +3317,220 @@ test_resurrect_dry_run_names_the_master_it_would_reopen() {
   out="$(WANT_TMUX=1 iw resurrect -n 2>&1)"
   assert_contains "dry run names it" "master of 'alpha': would open" "$out"
   assert_eq "and opens nothing" "" "$(windows_of_session projects-alpha)"
+}
+
+# The default claude stub throws its arguments away, and what these are about is
+# exactly the arguments: which sessions get Remote Control and under what name.
+recording_claude() {
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$SB/claude-argv"
+exit 0
+STUB
+  chmod +x "$SB/bin/claude"
+}
+
+# send-keys returns before the pane's shell has run anything.
+wait_for_claude_argv() {
+  local waited=0
+  while (( waited < 50 )); do
+    grep -q "$1" "$SB/claude-argv" 2>/dev/null && return 0
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+test_master_remote_control_names_the_master() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  WANT_MASTER_RC=on iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw --detach feat/two -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv 'remote-control' || true
+  local argv
+  argv="$(cat "$SB/claude-argv" 2>/dev/null)"
+  assert_contains "the master is started with Remote Control" \
+    "--remote-control myproj (master)" "$argv"
+  # Only the master: the task was started first, so its line is the one without.
+  assert_eq "and the task is not" "1" "$(grep -c 'remote-control' "$SB/claude-argv" 2>/dev/null | tr -d ' ')"
+}
+
+test_master_remote_control_is_off_by_default() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 iw master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv '' || true
+  case "$(cat "$SB/claude-argv" 2>/dev/null)" in
+    *remote-control*) bad "a master got Remote Control without asking for it" ;;
+    *) ok ;;
+  esac
+}
+
+test_master_remote_control_passes_the_message_through() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw -m 'plan the split' master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv 'plan the split' || true
+  # The optional name must not swallow the prompt, and the prompt stays last.
+  assert_contains "flag, name and prompt all arrive in order" \
+    "--remote-control myproj (master) -- plan the split" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
+test_resurrect_keeps_remote_control_on_a_master() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw master myproj >/dev/null 2>&1
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on iw resurrect -n 2>&1)"
+  assert_contains "the master comes back with Remote Control" \
+    "master of 'myproj': would run 'claude --continue --remote-control myproj\ \(master\)'" "$out"
+  assert_contains "and the task comes back without" "feat-one: would run 'claude --continue'" "$out"
+}
+
+test_update_keeps_remote_control_on_a_master() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  fake_claude || { printf '    skip (no cc to build the agent stub)\n'; return 0; }
+  WANT_TMUX=1 iw --detach feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=on iw master myproj >/dev/null 2>&1
+  wait_for_agent '=projects-myproj:myproj' || { printf '    skip (agent never started)\n'; return 0; }
+  wait_for_agent '=projects-myproj:feat-one' || { printf '    skip (agent never started)\n'; return 0; }
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on WANT_UPDATE_CLAUDE="$(bump_version_command)" iw update-agents -n 2>&1)"
+  assert_contains "the master restarts with Remote Control" \
+    "master of 'myproj': would restart with 'claude --continue --remote-control myproj\ \(master\)'" "$out"
+  assert_contains "and the task without" "feat-one: would restart with 'claude --continue'" "$out"
+}
+
+test_master_remote_control_off_means_off() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_TMUX=1 WANT_MASTER_RC=off iw master myproj >/dev/null 2>&1
+
+  wait_for_claude_argv '' || true
+  case "$(cat "$SB/claude-argv" 2>/dev/null)" in
+    *remote-control*) bad "IWORK_MASTER_REMOTE_CONTROL=off still gave the master Remote Control" ;;
+    *) ok ;;
+  esac
+}
+
+# 'iwork master' refuses such a name, but resurrect and update-agents walk every
+# directory under the projects dir, hand-made ones included. The resume line is
+# typed into a shell, so the name has to arrive as one argument, quotes and all.
+test_resurrect_quotes_a_master_name_with_spaces_and_quotes() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local project="it's \"my\" proj"
+  local session="projects-it's \"my\" proj"
+  recording_claude
+  mkdir -p "$SB_PROJECTS/$project"
+  # A plain sh in a clean environment: the operator's shell startup would put
+  # a real claude back ahead of the recording stub.
+  tmux_t new-session -d -s "$session" -n "$project" -c "$SB_PROJECTS/$project" \
+    env -i HOME="$SB_HOME" PATH="$SB/bin:/usr/bin:/bin" /bin/sh 2>/dev/null ||
+    { printf '    skip (tmux would not make the session)\n'; return 0; }
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on iw resurrect --fresh 2>&1)"
+  wait_for_claude_argv 'remote-control' || true
+  assert_eq "the name arrives as one argument, quotes intact" \
+    "--remote-control it's \"my\" proj (master)" "$(cat "$SB/claude-argv" 2>/dev/null)"
+  assert_contains "and resurrect says what it ran" "master of '$project': restarted with" "$out"
+}
+
+test_master_refuses_a_project_name_with_spaces() {
+  recording_claude
+  mkdir -p "$SB_PROJECTS/my proj"
+  local out
+  out="$(WANT_MASTER_RC=on iw master 'my proj' 2>&1 || true)"
+  assert_contains "refused before anything starts" "unsupported characters" "$out"
+  assert_eq "and no claude ran" "" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
+test_config_checks_master_remote_control() {
+  local out
+  out="$(iw config set master-remote-control maybe 2>&1 || true)"
+  assert_contains "a value that is neither on nor off is refused" "is on or off" "$out"
+  iw config set master-remote-control on >/dev/null 2>&1
+  assert_eq "on is accepted and read back" "on" "$(iw config get master-remote-control 2>&1)"
+}
+
+test_resurrect_leaves_remote_control_off_for_an_unsafe_name() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  local project="=ls"
+  mkdir -p "$SB_PROJECTS/$project"
+  tmux_t new-session -d -s "projects-$project" -n "$project" -c "$SB_PROJECTS/$project" \
+    env -i HOME="$SB_HOME" PATH="$SB/bin:/usr/bin:/bin" /bin/sh 2>/dev/null ||
+    { printf '    skip (tmux would not make the session)\n'; return 0; }
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=On iw resurrect -n 2>&1)"
+  assert_contains "the master still comes back, without the flag" \
+    "master of '$project': would run 'claude --continue'" "$out"
+  assert_contains "and says why" "not safe to type into a shell" "$out"
+}
+
+test_master_remote_control_value_is_not_case_sensitive() {
+  mk_repo backend
+  recording_claude
+  iw feat/one -r backend -p myproj >/dev/null 2>&1
+  WANT_MASTER_RC=ON iw master myproj >/dev/null 2>&1
+  assert_contains "ON is on" "--remote-control myproj (master)" "$(cat "$SB/claude-argv" 2>/dev/null)"
+}
+
+# A master reopened after the server died is the one restart nobody watches:
+# it must come back on the phone too (IWORK_MASTER_REMOTE_CONTROL).
+test_resurrect_reopened_master_keeps_remote_control() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  mk_repo backend
+  mk_repo frontend
+  recording_claude
+  WANT_TMUX=1 iw --detach feat/one -r backend -p alpha >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r frontend -p beta >/dev/null 2>&1
+  local p=""
+  for p in alpha beta; do
+    printf '2026-11-07T10:00:00+0000\tregistered\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\t\n' "$p" >> "$SB_PROJECTS/$p/agents.tsv"
+    printf '2026-11-07T10:05:00+0000\tended\t\tsess-%s\t1\t%%1\t/x.jsonl\tmaster\tother\n' "$p" >> "$SB_PROJECTS/$p/agents.tsv"
+  done
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+  : > "$SB/claude-argv"
+
+  local out
+  out="$(WANT_TMUX=1 WANT_MASTER_RC=on iw resurrect 2>&1)"
+  assert_contains "the report shows the flag" "master of 'alpha': opened its window running 'claude --continue --remote-control alpha\ \(master\)'" "$out"
+  local i=""
+  for i in $(seq 50); do
+    [ "$(grep -c -- '--remote-control' "$SB/claude-argv" 2>/dev/null)" -ge 2 ] && break
+    sleep 0.1
+  done
+  assert_grep "alpha's master is back on Remote Control" "^--continue --remote-control alpha (master)$" "$SB/claude-argv"
+  assert_grep "and beta's" "^--continue --remote-control beta (master)$" "$SB/claude-argv"
+
+  # Off: the same reopen without the flag.
+  tmux_t kill-server >/dev/null 2>&1
+  tmux_t start-server </dev/null >/dev/null 2>&1
+  : > "$SB/claude-argv"
+  WANT_TMUX=1 iw resurrect >/dev/null 2>&1
+  for i in $(seq 50); do
+    [ "$(grep -c -- '--continue' "$SB/claude-argv" 2>/dev/null)" -ge 4 ] && break
+    sleep 0.1
+  done
+  assert_no_grep "no flag when it is off" "remote-control" "$SB/claude-argv"
+  assert_grep "but still on its last conversation" "^--continue$" "$SB/claude-argv"
 }
 
 test_resurrect_gathers_a_projects_task_back_into_its_session() {
