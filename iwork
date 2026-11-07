@@ -132,6 +132,7 @@ Usage: iwork [flags] <branch-name> [--from <task|branch>]
        iwork project agents [--json|--tsv] [-p <project> | <project>]
        iwork project grep [-p <project>] <pattern> [ripgrep-args...]
        iwork project cat [-p <project>] <path-inside-the-project>
+       iwork project new <project>
        iwork project add <project> [<task>]
        iwork project rm [<project>] [<task>]
        iwork project delete [-rf] <project>
@@ -417,6 +418,10 @@ Projects:
 
   'iwork project -h' lists just the project commands, grouped by whether they
   read, record, or manage — that is the help an agent is pointed at.
+
+  'iwork project new <project>' creates an empty project without asking, for
+  a project that should exist before any task does (to start its master
+  first). Naming one with -p asks before creating it, which needs a terminal.
 
   'iwork project add <project> [<task>]' attaches a task that already exists,
   so work already in flight can join a project. The task name may be left out
@@ -2072,7 +2077,7 @@ _iwork() {
     project)
       sub="${COMP_WORDS[2]:-}"
       if (( COMP_CWORD == 2 )); then
-        COMPREPLY=( $(compgen -W "list show agents grep cat add rm delete" -- "$cur") )
+        COMPREPLY=( $(compgen -W "list show agents grep cat new add rm delete" -- "$cur") )
         return 0
       fi
       case "$sub" in
@@ -2437,6 +2442,7 @@ _iwork() {
           'agents[list the sessions live in the project and their tasks]' \
           'grep[search the project memory]' \
           'cat[print one file from the project memory]' \
+          'new[create an empty project]' \
           'add[attach an existing task to a project]' \
           'rm[detach a task, keeping the project memory]' \
           'delete[delete a project and its memory]'
@@ -4899,11 +4905,12 @@ append_history() {
 # 'role' is appended rather than inserted: project files written before masters
 # existed keep every field where project_agents already expects it, and their
 # rows read back as the task agents they were.
-AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript\trole'
+AGENTS_HEADER=$'# timestamp\tevent\ttask\tsession\tpid\tpane\ttranscript\trole\treason'
 
 # Set from the hook payload, because the transcript path is the one field the
 # environment does not carry.
 HOOK_TRANSCRIPT=""
+HOOK_END_REASON=""
 
 # Records this session joining or leaving a project. One printf under O_APPEND,
 # for the same reason capture is: several sessions in one project come up at
@@ -4916,6 +4923,9 @@ append_agent() {
   local event="$2"
   local task="$3"
   local role="${4:-task}"
+  # Why a session ended, from the SessionEnd hook: 'prompt_input_exit' for an
+  # /exit, 'other' for a hangup. Empty on every other row.
+  local reason="${5:-}"
   local file="$PROJECTS_DIR/$project/agents.tsv"
 
   # No session id means this is not a Claude session — a bare shell running
@@ -4929,11 +4939,11 @@ append_agent() {
       { warn "could not create agents.tsv"; return 1; }
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%Y-%m-%dT%H:%M:%S%z)" "$event" "$(oneline "$task")" \
     "$(oneline "$CLAUDE_CODE_SESSION_ID")" "$(oneline "${CLAUDE_PID:-}")" \
     "$(oneline "${TMUX_PANE:-}")" "$(oneline "$HOOK_TRANSCRIPT")" \
-    "$(oneline "$role")" \
+    "$(oneline "$role")" "$(oneline "$reason")" \
     >> "$file" || { warn "could not append to agents.tsv"; return 1; }
 }
 
@@ -6819,6 +6829,60 @@ resurrect_find_master() {
   printf '%s\n' "${line%% *}"
 }
 
+# Whether a project's master should come back after its window died: it has
+# had one, and the last master row is not an 'ended' whose reason says
+# someone closed it (/exit, logout). A hangup ends a session too, with reason
+# 'other'; rows written before reasons were recorded have none, and count as a
+# hangup, since that is what a dead server leaves behind.
+project_master_wanted() {
+  local file="$PROJECTS_DIR/$1/agents.tsv"
+
+  [[ -f "$file" ]] || return 1
+  awk -F'\t' '
+    /^#/ { next }
+    $8 == "master" { seen = 1; event = $2; reason = $9 }
+    END {
+      if (!seen) exit 1
+      if (event == "ended" && (reason == "prompt_input_exit" || reason == "logout")) exit 1
+      exit 0
+    }' "$file"
+}
+
+# A dead server takes every master window with it, and resurrect used to bring
+# back only masters whose window had survived, i.e. none, after the one event
+# it exists for. A project whose master died rather than being closed, and
+# that still has tasks, gets its master back on its last conversation.
+resurrect_reopen_master() {
+  local project="$1"
+  local cmd=(claude)
+  local rc_name=""
+  local shown=""
+
+  # The same command resurrect types into a surviving master's pane
+  # (resurrect_agent_cmd <project>), built as words for spawn_agent_window,
+  # which quotes each one: with IWORK_MASTER_REMOTE_CONTROL on, a reopened
+  # master is back on the phone under the same name. One source for what is
+  # typed and what is reported, so the two can't drift.
+  [[ -z "$RESURRECT_CONTINUE" ]] || cmd+=(--continue)
+  if rc_name="$(master_remote_control_name "$project" claude)"; then
+    cmd+=(--remote-control "$rc_name")
+  fi
+  # Reported from the same words, quoted the way spawn_agent_window types them.
+  printf -v shown '%q ' "${cmd[@]}"
+  shown="${shown% }"
+
+  if [[ -n "$RESURRECT_DRY" ]]; then
+    echo "  master of '$project': would open its window running '$shown'"
+    return 0
+  fi
+
+  if ! spawn_agent_window --first "$(project_session_name "$project")" "$project" "$PROJECTS_DIR/$project" "${cmd[@]}" >/dev/null; then
+    warn "master of '$project': could not open its window"
+    return 1
+  fi
+  echo "  master of '$project': opened its window running '$shown'"
+}
+
 resurrect_projects() {
   local project=""
   local window_id=""
@@ -6832,6 +6896,8 @@ resurrect_projects() {
     if window_id="$(resurrect_find_master "$project")"; then
       pane="$(window_agent_pane "$window_id")"
       [[ -z "$pane" ]] || resurrect_start_agent "$pane" "master of '$project'" "$project"
+    elif project_master_wanted "$project" && [[ -n "$(project_tasks_live "$project")" ]]; then
+      resurrect_reopen_master "$project" || true
     else
       echo "  project '$project' has no master; start one with: iwork master $project"
     fi
@@ -7131,7 +7197,7 @@ hook_session_start() {
 hook_session_end() {
   hook_project_context || return 0
 
-  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" "$HOOK_ROLE" 2>/dev/null || true
+  append_agent "$HOOK_PROJECT" ended "$HOOK_TASK" "$HOOK_ROLE" "$HOOK_END_REASON" 2>/dev/null || true
 }
 
 # Fires exactly when the reasoning is about to be dropped, which is the one
@@ -7273,6 +7339,12 @@ handle_claude_hook() {
   # so the hook still needs no JSON parser.
   HOOK_TRANSCRIPT="$(printf '%s' "$input" |
     sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -1 || true)"
+
+  # SessionEnd only: why the session ended, which is what lets resurrect tell
+  # a master closed with /exit from one that died with the tmux server.
+  HOOK_END_REASON="$(printf '%s' "$input" |
+    sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
     head -1 || true)"
 
   case "$event" in
@@ -7538,6 +7610,7 @@ sibling tasks are appending to while you work:
 Managing — the operator's, not an agent's; these change or destroy tasks, so do
 not run them unless you were asked to directly (a project's master may also run
 'iwork cull', which removes only tasks git can give back):
+  iwork project new <project>            create an empty project, no prompt
   iwork project add <project> [<task>]   attach a task that already exists
   iwork project rm [<project>] [<task>]  detach a task, keeping the memory
   iwork project delete [-rf] <project>   delete a project and its memory
@@ -7643,6 +7716,22 @@ cmd_project() {
       resolve_project_context "$proj"
       project_grep "$RESOLVED_PROJECT" "$@" || rc=$?
       return "$rc"
+      ;;
+    new)
+      # The verb is the confirmation. ensure_project asks before creating
+      # because '-p' is one typo away from a stray project; here creating one
+      # is the whole request, and a session with no terminal (intake on a
+      # server, a master) has nobody to answer the question anyway.
+      (( $# == 1 )) || die "usage: iwork project new <project>"
+      require_config
+      require_projects_dir
+      validate_project_name "$1"
+      proj="$(canonical_project_name "$1")"
+      # An existing project is an error, not a no-op: whoever asked for a new
+      # one is about to treat it as theirs.
+      project_exists "$proj" && die "project '$proj' already exists"
+      create_project "$proj"
+      echo "Created project '$proj' at $PROJECTS_DIR/$proj"
       ;;
     add)
       (( $# >= 1 && $# <= 2 )) || die "usage: iwork project add <project> [<task>]"

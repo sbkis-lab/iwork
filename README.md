@@ -234,7 +234,11 @@ iwork feat/token-api -r auth-service -p auth-rewrite
 ```
 
 The project is created on first use (after confirming), and the task folder gets a
-`.project` symlink pointing at it:
+`.project` symlink pointing at it. To create one before any task exists, say to
+start its [master](#the-master-one-agent-whose-job-is-the-project) first, use
+`iwork project new auth-rewrite`: the command is the confirmation, so it never
+prompts, and it works from a session with no terminal. It refuses a name that is
+already a project (in any case) or a task.
 
 ```
 ~/dev/projects/
@@ -1453,12 +1457,18 @@ iwork resurrect --big feat-big-thing
 
 Everything else comes back as an ordinary window.
 
-### Masters are restarted, never created
+### Masters come back; new ones are never made
 
 A master is a standing agent holding its project's brief, so starting a batch of
 them for projects that never had one is not a restore. `resurrect` restarts the
-masters that are there, and names the projects that have none so you can start
-one yourself with `iwork master <project>`.
+masters whose window is there, and reopens the window of one the server took
+with it: a project that has had a master (`agents.tsv` says so) and still has
+tasks gets its first window back running `claude --continue` in the project
+directory. A project that never had a master, or whose tasks are all gone, is
+only named, so you can start one yourself with `iwork master <project>`.
+
+Before this, a dead server meant no master came back at all: there was no window
+left to restart, which is the one case `resurrect` exists for.
 
 ### Session state without renaming
 
