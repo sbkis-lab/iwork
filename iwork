@@ -6808,12 +6808,15 @@ resurrect_reopen_master() {
   # The same command resurrect types into a surviving master's pane
   # (resurrect_agent_cmd <project>), built as words for spawn_agent_window,
   # which quotes each one: with IWORK_MASTER_REMOTE_CONTROL on, a reopened
-  # master is back on the phone under the same name.
+  # master is back on the phone under the same name. One source for what is
+  # typed and what is reported, so the two can't drift.
   [[ -z "$RESURRECT_CONTINUE" ]] || cmd+=(--continue)
   if rc_name="$(master_remote_control_name "$project" claude)"; then
     cmd+=(--remote-control "$rc_name")
   fi
-  shown="$(resurrect_agent_cmd "$project")"
+  # Reported from the same words, quoted the way spawn_agent_window types them.
+  printf -v shown '%q ' "${cmd[@]}"
+  shown="${shown% }"
 
   if [[ -n "$RESURRECT_DRY" ]]; then
     echo "  master of '$project': would open its window running '$shown'"
