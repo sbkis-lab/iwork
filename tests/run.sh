@@ -5106,6 +5106,119 @@ test_repos_session_name_may_not_shadow_a_task_session() {
   assert_eq "no session made" "" "$(windows_of_session tasks-repos)"
 }
 
+test_spawned_panes_turn_off_the_oh_my_zsh_update_prompt() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  tmux_supports_session_env || { printf '    skip (tmux before 3.2 gets no -e)\n'; return 0; }
+  mk_repo backend
+
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+printf 'auto=%s prompt=%s\n' "\$DISABLE_AUTO_UPDATE" "\$DISABLE_UPDATE_PROMPT" >> "$SB/claude-env"
+exit 0
+STUB
+  chmod +x "$SB/bin/claude"
+
+  # A plain sh that keeps the pane's environment, which is the thing under test,
+  # but not the operator's PATH: their shell startup would put a real claude
+  # ahead of the stub.
+  cat > "$SB/bin/plainsh" <<SH
+#!/bin/sh
+exec env -u ENV PATH="$SB/bin:/usr/bin:/bin" /bin/sh
+SH
+  chmod +x "$SB/bin/plainsh"
+
+  # Whatever the operator's own environment holds must not make this pass.
+  tmux_t start-server \; set -s exit-empty off \; set -g default-shell "$SB/bin/plainsh" \; \
+    set-environment -gu DISABLE_AUTO_UPDATE \; set-environment -gu DISABLE_UPDATE_PROMPT >/dev/null 2>&1
+
+  # The first task makes the session, the second adds a window to it: both ways
+  # a pane is created.
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+
+  local waited=0
+  while (( waited < 80 )) && [[ "$({ wc -l < "$SB/claude-env"; } 2>/dev/null | tr -d ' ')" != 2 ]]; do
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  assert_eq "both agent panes start with the update check off" \
+    "auto=true prompt=true
+auto=true prompt=true" "$(cat "$SB/claude-env" 2>/dev/null)"
+  # The session keeps none of it, so the operator's own windows there still get
+  # oh-my-zsh's updates, and feat-two had it from new-window -e, not from the
+  # session feat-one made.
+  assert_eq "the session environment is left clean" "" \
+    "$(tmux_t show-environment -t '=tasks' 2>/dev/null | grep '^DISABLE_' || true)"
+}
+
+# 'tmux new-session -e' is tmux 3.2; before that iwork passes no environment.
+tmux_supports_session_env() {
+  local version=""
+
+  version="$(tmux -V 2>/dev/null || true)"
+  [[ "$version" =~ ^tmux\ ([0-9]+)\.([0-9]+) ]] || return 1
+  (( BASH_REMATCH[1] > 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] >= 2) ))
+}
+
+# The laude bug as it was seen: oh-my-zsh asks whether to update at shell start
+# and takes one key as the answer, which is the first byte of what iwork typed.
+test_spawned_panes_survive_the_oh_my_zsh_update_question() {
+  command -v tmux >/dev/null 2>&1 || { printf '    skip (no tmux)\n'; return 0; }
+  tmux_supports_session_env || { printf '    skip (tmux before 3.2 gets no -e)\n'; return 0; }
+  mk_repo backend
+
+  cat > "$SB/bin/claude" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$SB/claude-argv"
+exit 0
+STUB
+  chmod +x "$SB/bin/claude"
+
+  # Asks the way oh-my-zsh does, unless told not to, and reads one raw key.
+  cat > "$SB/bin/omzsh" <<SH
+#!/bin/sh
+if [ "\$DISABLE_AUTO_UPDATE" != true ]; then
+  sleep 0.3
+  printf '[oh-my-zsh] Would you like to update? [Y/n] '
+  old="\$(stty -g)"
+  stty -icanon -echo min 1
+  dd bs=1 count=1 >/dev/null 2>&1
+  stty "\$old"
+  echo
+fi
+exec env -u ENV PATH="$SB/bin:/usr/bin:/bin" /bin/sh
+SH
+  chmod +x "$SB/bin/omzsh"
+
+  tmux_t start-server \; set -s exit-empty off \; set -g default-shell "$SB/bin/omzsh" \; \
+    set-environment -gu DISABLE_AUTO_UPDATE \; set-environment -gu DISABLE_UPDATE_PROMPT >/dev/null 2>&1
+
+  # A new session and a window added to it: both ways an agent pane is made.
+  WANT_TMUX=1 iw --detach feat/one -r backend >/dev/null 2>&1
+  WANT_TMUX=1 iw --detach feat/two -r backend >/dev/null 2>&1
+
+  local waited=0
+  while (( waited < 50 )) && [[ "$({ wc -l < "$SB/claude-argv"; } 2>/dev/null | tr -d ' ')" != 2 ]]; do
+    command sleep 0.1
+    waited=$((waited + 1))
+  done
+  assert_eq "both agents start, with no key eaten" "2" \
+    "$({ wc -l < "$SB/claude-argv"; } 2>/dev/null | tr -d ' ')"
+}
+
+# Asking tmux its version must not take iwork down where there is no tmux.
+test_big_without_tmux_still_succeeds() {
+  if PATH="/usr/bin:/bin" command -v tmux >/dev/null 2>&1; then
+    printf '    skip (tmux is in /usr/bin or /bin, so it cannot be hidden)\n'
+    return 0
+  fi
+  mk_repo backend
+  local rc=0
+  PATH="$SB/bin:/usr/bin:/bin" iw --big feat/one -r backend >/dev/null 2>&1 || rc=$?
+  assert_eq "iwork --big exits 0 without tmux" "0" "$rc"
+  assert_dir "and the worktree is there" "$SB_TASKS/feat-one/backend"
+}
+
 # --- runner -------------------------------------------------------------------
 
 echo "iwork tests  ($IWORK_SRC)"
